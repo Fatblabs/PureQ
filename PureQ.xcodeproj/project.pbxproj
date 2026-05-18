@@ -6,8 +6,26 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D1A000000000000000000004 /* PureQDriver.c in Sources */ = {isa = PBXBuildFile; fileRef = D1A000000000000000000002 /* PureQDriver.c */; };
+		D1A000000000000000000005 /* PureQ.driver in Resources */ = {isa = PBXBuildFile; fileRef = D1A000000000000000000001 /* PureQ.driver */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D1A00000000000000000000E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A80BD0AC2FB262C400C1A726 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D1A00000000000000000000A;
+			remoteInfo = PureQDriver;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		A80BD0B42FB262C400C1A726 /* PureQ.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PureQ.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D1A000000000000000000001 /* PureQ.driver */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PureQ.driver; sourceTree = BUILT_PRODUCTS_DIR; };
+		D1A000000000000000000002 /* PureQDriver.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PureQDriver.c; sourceTree = "<group>"; };
+		D1A000000000000000000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -26,6 +44,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D1A000000000000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -33,6 +58,7 @@
 			isa = PBXGroup;
 			children = (
 				A80BD0B62FB262C400C1A726 /* PureQ */,
+				D1A000000000000000000006 /* PureQDriver */,
 				A80BD0B52FB262C400C1A726 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,8 +67,18 @@
 			isa = PBXGroup;
 			children = (
 				A80BD0B42FB262C400C1A726 /* PureQ.app */,
+				D1A000000000000000000001 /* PureQ.driver */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		D1A000000000000000000006 /* PureQDriver */ = {
+			isa = PBXGroup;
+			children = (
+				D1A000000000000000000002 /* PureQDriver.c */,
+				D1A000000000000000000003 /* Info.plist */,
+			);
+			path = PureQDriver;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -59,6 +95,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				D1A00000000000000000000F /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				A80BD0B62FB262C400C1A726 /* PureQ */,
@@ -69,6 +106,25 @@
 			productName = PureQ;
 			productReference = A80BD0B42FB262C400C1A726 /* PureQ.app */;
 			productType = "com.apple.product-type.application";
+		};
+		D1A00000000000000000000A /* PureQDriver */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D1A00000000000000000000B /* Build configuration list for PBXNativeTarget "PureQDriver" */;
+			buildPhases = (
+				D1A000000000000000000009 /* Sources */,
+				D1A000000000000000000007 /* Frameworks */,
+				D1A000000000000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PureQDriver;
+			packageProductDependencies = (
+			);
+			productName = PureQ;
+			productReference = D1A000000000000000000001 /* PureQ.driver */;
+			productType = "com.apple.product-type.bundle";
 		};
 /* End PBXNativeTarget section */
 
@@ -81,6 +137,9 @@
 				LastUpgradeCheck = 2640;
 				TargetAttributes = {
 					A80BD0B32FB262C400C1A726 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					D1A00000000000000000000A = {
 						CreatedOnToolsVersion = 26.4.1;
 					};
 				};
@@ -100,12 +159,21 @@
 			projectRoot = "";
 			targets = (
 				A80BD0B32FB262C400C1A726 /* PureQ */,
+				D1A00000000000000000000A /* PureQDriver */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		A80BD0B22FB262C400C1A726 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D1A000000000000000000005 /* PureQ.driver in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1A000000000000000000008 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +190,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D1A000000000000000000009 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D1A000000000000000000004 /* PureQDriver.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D1A00000000000000000000F /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D1A00000000000000000000A /* PureQDriver */;
+			targetProxy = D1A00000000000000000000E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A80BD0BD2FB262C600C1A726 /* Debug */ = {
@@ -251,15 +335,19 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_APP_INTENTS_METADATA = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "PureQ-Info.plist";
+				INFOPLIST_KEY_NSAudioCaptureUsageDescription = "PureQ captures system audio so it can apply equalizer and routing processing before sending it to your selected output.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Sean-s-Apps.PureQ";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -281,15 +369,19 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_APP_INTENTS_METADATA = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "PureQ-Info.plist";
+				INFOPLIST_KEY_NSAudioCaptureUsageDescription = "PureQ captures system audio so it can apply equalizer and routing processing before sending it to your selected output.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Sean-s-Apps.PureQ";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -300,6 +392,69 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		D1A00000000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PureQDriver/Info.plist;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@loader_path/../Frameworks",
+				);
+				MACH_O_TYPE = mh_bundle;
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = NO;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					CoreAudio,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "Sean-s-Apps.PureQ.driver";
+				PRODUCT_NAME = PureQ;
+				SDKROOT = macosx;
+				SKIP_INSTALL = NO;
+				WRAPPER_EXTENSION = driver;
+			};
+			name = Debug;
+		};
+		D1A00000000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PureQDriver/Info.plist;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@loader_path/../Frameworks",
+				);
+				MACH_O_TYPE = mh_bundle;
+				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					CoreAudio,
+					"-framework",
+					CoreFoundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "Sean-s-Apps.PureQ.driver";
+				PRODUCT_NAME = PureQ;
+				SDKROOT = macosx;
+				SKIP_INSTALL = NO;
+				WRAPPER_EXTENSION = driver;
 			};
 			name = Release;
 		};
@@ -320,6 +475,15 @@
 			buildConfigurations = (
 				A80BD0C02FB262C600C1A726 /* Debug */,
 				A80BD0C12FB262C600C1A726 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D1A00000000000000000000B /* Build configuration list for PBXNativeTarget "PureQDriver" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D1A00000000000000000000C /* Debug */,
+				D1A00000000000000000000D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
