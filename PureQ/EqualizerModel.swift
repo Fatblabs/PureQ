@@ -5,6 +5,7 @@
 
 import AppKit
 import Combine
+import CoreAudio
 import Foundation
 import SwiftUI
 
@@ -23,6 +24,22 @@ enum EqualizerMode: String, CaseIterable, Identifiable, Codable {
             return [25, 40, 63, 100, 160, 250, 400, 630, 1_000, 1_600, 2_500, 4_000, 6_300, 10_000, 16_000]
         case .expert:
             return EqualizerBand.standardFrequencies
+        }
+    }
+}
+
+enum EqualizerBandLayout: String, CaseIterable, Identifiable {
+    case bands10
+    case bands31
+    case custom
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .bands10: return "10 Bands"
+        case .bands31: return "31 Bands"
+        case .custom: return "Custom"
         }
     }
 }
@@ -534,11 +551,13 @@ final class AudioTelemetryStore: ObservableObject {
     @Published private(set) var telemetry: AudioEngineTelemetry = .empty
 
     private var smoothedBandLevels = Array(repeating: 0.0, count: EqualizerBand.standardFrequencies.count)
+    private var smoothedSpectrumLevels: [Double] = []
     private var meterIndexByRoundedFrequency: [Int: Int] = [:]
     private var lastPublishTime = 0.0
 
     func reset() {
         smoothedBandLevels = Array(repeating: 0.0, count: EqualizerBand.standardFrequencies.count)
+        smoothedSpectrumLevels.removeAll(keepingCapacity: true)
         meterIndexByRoundedFrequency.removeAll(keepingCapacity: true)
         lastPublishTime = 0
         telemetry = .empty
@@ -546,6 +565,7 @@ final class AudioTelemetryStore: ObservableObject {
 
     func publish(_ snapshot: AudioEngineTelemetry, smoothMeters: Bool) {
         let levels = smoothedLevels(from: snapshot.bandLevels, smoothMeters: smoothMeters)
+        let spectrum = smoothedSpectrum(from: snapshot.spectrumLevels, smoothMeters: smoothMeters)
         let next = AudioEngineTelemetry(
             capturedFrames: snapshot.capturedFrames,
             renderedFrames: snapshot.renderedFrames,
@@ -553,7 +573,8 @@ final class AudioTelemetryStore: ObservableObject {
             bufferedFrames: snapshot.bufferedFrames,
             inputCallbacks: snapshot.inputCallbacks,
             renderCallbacks: snapshot.renderCallbacks,
-            bandLevels: levels
+            bandLevels: levels,
+            spectrumLevels: spectrum
         )
 
         guard shouldPublish(next) else { return }
@@ -602,8 +623,33 @@ final class AudioTelemetryStore: ObservableObject {
         return smoothedBandLevels
     }
 
+    private func smoothedSpectrum(from rawLevels: [Double], smoothMeters: Bool) -> [Double] {
+        guard !rawLevels.isEmpty else {
+            smoothedSpectrumLevels.removeAll(keepingCapacity: true)
+            return []
+        }
+
+        if smoothedSpectrumLevels.count != rawLevels.count {
+            smoothedSpectrumLevels = Array(repeating: 0.0, count: rawLevels.count)
+        }
+
+        guard smoothMeters else {
+            smoothedSpectrumLevels = rawLevels
+            return rawLevels
+        }
+
+        for index in rawLevels.indices {
+            let current = smoothedSpectrumLevels[index]
+            let target = rawLevels[index].clamped(to: 0...1)
+            let response = target > current ? 0.28 : 0.085
+            smoothedSpectrumLevels[index] = current + ((target - current) * response)
+        }
+        return smoothedSpectrumLevels
+    }
+
     private func shouldPublish(_ next: AudioEngineTelemetry) -> Bool {
         let levelsChanged = bandLevelsChangedSignificantly(next.bandLevels)
+        let spectrumChanged = spectrumLevelsChangedSignificantly(next.spectrumLevels)
         let countersChanged = telemetry.capturedFrames != next.capturedFrames ||
             telemetry.renderedFrames != next.renderedFrames ||
             telemetry.underrunFrames != next.underrunFrames ||
@@ -611,10 +657,10 @@ final class AudioTelemetryStore: ObservableObject {
             telemetry.inputCallbacks != next.inputCallbacks ||
             telemetry.renderCallbacks != next.renderCallbacks
 
-        guard levelsChanged || countersChanged else { return false }
+        guard levelsChanged || spectrumChanged || countersChanged else { return false }
 
         let now = Date.timeIntervalSinceReferenceDate
-        if levelsChanged || now - lastPublishTime >= 0.25 {
+        if levelsChanged || spectrumChanged || now - lastPublishTime >= 0.25 {
             lastPublishTime = now
             return true
         }
@@ -625,6 +671,13 @@ final class AudioTelemetryStore: ObservableObject {
         guard telemetry.bandLevels.count == nextLevels.count else { return true }
         return zip(telemetry.bandLevels, nextLevels).contains { oldValue, newValue in
             abs(oldValue - newValue) > 0.008
+        }
+    }
+
+    private func spectrumLevelsChangedSignificantly(_ nextLevels: [Double]) -> Bool {
+        guard telemetry.spectrumLevels.count == nextLevels.count else { return true }
+        return zip(telemetry.spectrumLevels, nextLevels).contains { oldValue, newValue in
+            abs(oldValue - newValue) > 0.012
         }
     }
 }
@@ -648,6 +701,11 @@ final class EqualizerModel: ObservableObject {
             if audioEngineRunState == .running {
                 startEngineTelemetryPolling()
             }
+        }
+    }
+    @Published var spectrumAnalyzerEnabled = false {
+        didSet {
+            updateAudioEngineRendering(scheduleSave: false)
         }
     }
     @Published var autoStartEngineEnabled = true {
@@ -723,6 +781,7 @@ final class EqualizerModel: ObservableObject {
     private var engineTelemetryTimer: Timer?
     private var autoStartWorkItem: DispatchWorkItem?
     private var persistenceWorkItem: DispatchWorkItem?
+    private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var persistenceSaveToken: UUID?
     private var lastQueuedSessionSnapshot: PureQSessionSnapshot?
     private var lastWrittenSessionSnapshot: PureQSessionSnapshot?
@@ -737,15 +796,18 @@ final class EqualizerModel: ObservableObject {
     private var manualBalance: Double = 0
     private var manualBands = EqualizerBand.makeStandardBands()
     private var manualAutoGainEnabled = true
+    private var visibleGraphicalSurfaceIDs = Set<UUID>()
 
     var visibleBands: [EqualizerBand] {
-        let visibleFrequencies = Set(mode.frequencies)
-        return sortedBands(bands.filter { visibleFrequencies.contains($0.slotFrequency) || $0.isCustom })
+        sortedBands(bands)
     }
 
     func visibleEQBands(for node: RoutingNode) -> [EqualizerBand] {
-        let visibleFrequencies = Set(node.eqMode.frequencies)
-        return sortedBands(node.eqBands.filter { visibleFrequencies.contains($0.slotFrequency) || $0.isCustom })
+        sortedBands(node.eqBands)
+    }
+
+    func eqBandLayoutTitle(for node: RoutingNode) -> String {
+        bandLayout(for: node.eqMode, bands: node.eqBands).title
     }
 
     func bandActivityLevel(for frequency: Double) -> Double {
@@ -770,7 +832,14 @@ final class EqualizerModel: ObservableObject {
     }
 
     var activeEQBandLayoutTitle: String {
-        bandLayoutTitle(for: activeEQMode)
+        activeEQBandLayout.title
+    }
+
+    var activeEQBandLayout: EqualizerBandLayout {
+        if let activeEQNode {
+            return bandLayout(for: activeEQNode.eqMode, bands: activeEQNode.eqBands)
+        }
+        return bandLayout(for: mode, bands: bands)
     }
 
     var activeEQSelection: EqualizerSelection {
@@ -810,7 +879,8 @@ final class EqualizerModel: ObservableObject {
         }
         let activeCount = activeEQNode.eqBands.filter { $0.isEnabled && abs($0.gain) > 0.01 }.count
         let autoLabel = activeEQNode.eqAutoGainEnabled ? "Auto" : "Manual"
-        return "\(activeEQNode.eqMode.rawValue) / \(activeCount) active / \(autoLabel)"
+        let layoutLabel = bandLayout(for: activeEQNode.eqMode, bands: activeEQNode.eqBands).title
+        return "\(layoutLabel) / \(activeCount) active / \(autoLabel)"
     }
 
     var hardwareOutputDevices: [AudioOutputDevice] {
@@ -878,6 +948,7 @@ final class EqualizerModel: ObservableObject {
             outputName: renderOutput?.name ?? selectedOutputName,
             virtualCaptureUID: virtualCapture?.uid,
             virtualCaptureName: virtualCapture?.name,
+            spectrumAnalyzerEnabled: spectrumAnalyzerEnabled && !visibleGraphicalSurfaceIDs.isEmpty,
             processedTakeoverEnabled: audioEngineTakeoverActive
         )
     }
@@ -887,7 +958,10 @@ final class EqualizerModel: ObservableObject {
     }
 
     var canStartAudioEngine: Bool {
-        audioEngineStatus.state != .blocked && renderOutputDevice != nil
+        let configuration = audioEngineConfiguration
+        return audioEngineStatus.state != .blocked &&
+            !configuration.renderTargets.isEmpty &&
+            resolvedOutputDeviceIDs(for: configuration).count == configuration.renderTargets.count
     }
 
     var audioEngineTakeoverActive: Bool {
@@ -899,10 +973,8 @@ final class EqualizerModel: ObservableObject {
             return true
         }
 
-        guard let renderOutputUID = renderOutputDevice?.uid else {
-            return false
-        }
-        return defaultOutputUID == renderOutputUID || defaultSystemOutputUID == renderOutputUID
+        let routedOutputUIDs = routedHardwareOutputUIDs()
+        return activeOutputDefaultUIDs.contains { routedOutputUIDs.contains($0) }
     }
 
     init() {
@@ -912,6 +984,7 @@ final class EqualizerModel: ObservableObject {
             seedRoutingGraphIfNeeded()
         }
         startDevicePolling()
+        startLifecycleRefreshObservers()
         scheduleAutoStartIfNeeded()
     }
 
@@ -920,6 +993,27 @@ final class EqualizerModel: ObservableObject {
         engineTelemetryTimer?.invalidate()
         autoStartWorkItem?.cancel()
         persistenceWorkItem?.cancel()
+        for (center, observer) in lifecycleObservers {
+            center.removeObserver(observer)
+        }
+    }
+
+    func setGraphicalSurface(id: UUID, visible: Bool) {
+        let changed: Bool
+        if visible {
+            changed = visibleGraphicalSurfaceIDs.insert(id).inserted
+        } else {
+            changed = visibleGraphicalSurfaceIDs.remove(id) != nil
+        }
+
+        guard changed, audioEngineRunState == .running else { return }
+        startEngineTelemetryPolling()
+        audioEngine.updateRendering(configuration: audioEngineConfiguration)
+        if visible {
+            refreshAudioEngineTelemetry()
+        } else if visibleGraphicalSurfaceIDs.isEmpty {
+            telemetryStore.reset()
+        }
     }
 
     func exportActiveEQProfile(to url: URL) throws {
@@ -990,8 +1084,11 @@ final class EqualizerModel: ObservableObject {
 
         routingNodes = snapshot.routingNodes.map { node in
             var sanitizedNode = node
-            sanitizedNode.eqBands = sanitizedBands(node.eqBands)
-            sanitizedNode.eqManualBands = sanitizedBands(node.eqManualBands.isEmpty ? node.eqBands : node.eqManualBands)
+            sanitizedNode.eqBands = normalizedBands(sanitizedBands(node.eqBands), for: node.eqMode)
+            sanitizedNode.eqManualBands = normalizedBands(
+                sanitizedBands(node.eqManualBands.isEmpty ? node.eqBands : node.eqManualBands),
+                for: node.eqManualMode
+            )
             sanitizedNode.eqPreamp = node.eqPreamp.clamped(to: -20...20)
             sanitizedNode.eqBalance = node.eqBalance.clamped(to: -1...1)
             sanitizedNode.eqManualPreamp = node.eqManualPreamp.clamped(to: -20...20)
@@ -1007,6 +1104,7 @@ final class EqualizerModel: ObservableObject {
         routingConnections = snapshot.routingConnections.filter { connection in
             validNodeIDs.contains(connection.from) && validNodeIDs.contains(connection.to)
         }
+        integrateLegacyPureQBusNodes()
 
         if let activeID = snapshot.activeEQNodeID,
            routingNodes.contains(where: { $0.id == activeID && $0.kind == .equalizer }) {
@@ -1158,8 +1256,11 @@ final class EqualizerModel: ObservableObject {
             throw EQProfileFileError.emptyProfile
         }
 
-        let cleanedBands = sanitizedBands(profile.bands)
-        let cleanedManualBands = sanitizedBands(profile.manualBands.isEmpty ? profile.bands : profile.manualBands)
+        let cleanedBands = normalizedBands(sanitizedBands(profile.bands), for: profile.mode)
+        let cleanedManualBands = normalizedBands(
+            sanitizedBands(profile.manualBands.isEmpty ? profile.bands : profile.manualBands),
+            for: profile.manualMode
+        )
         return EQProfileSnapshot(
             title: profile.title.isEmpty ? "Imported EQ" : profile.title,
             mode: profile.mode,
@@ -1186,8 +1287,53 @@ final class EqualizerModel: ObservableObject {
         })
     }
 
+    private func normalizedBands(_ sourceBands: [EqualizerBand], for mode: EqualizerMode) -> [EqualizerBand] {
+        guard !hasCustomBandConfiguration(sourceBands) else {
+            return sortedBands(sourceBands)
+        }
+
+        switch mode {
+        case .basic where !matchesLayout(sourceBands, frequencies: EqualizerMode.basic.frequencies):
+            return retargetedBands(for: EqualizerMode.basic.frequencies, from: sourceBands)
+        case .expert where !matchesLayout(sourceBands, frequencies: EqualizerMode.expert.frequencies):
+            return retargetedBands(for: EqualizerMode.expert.frequencies, from: sourceBands)
+        default:
+            return sortedBands(sourceBands)
+        }
+    }
+
     func setMode(_ newMode: EqualizerMode) {
+        bands = retargetedBands(for: newMode.frequencies, from: bands)
         mode = newMode
+        applyAutoGainIfNeeded()
+        saveMainManualProfileIfNeeded()
+        syncLinkedEQNodes()
+        syncRoutingOutputNodes()
+        updateAudioEngineRendering()
+    }
+
+    func setBandLayout(_ layout: EqualizerBandLayout) {
+        let currentLayout = bandLayout(for: mode, bands: bands)
+        switch layout {
+        case .bands10:
+            bands = retargetedBands(for: EqualizerMode.basic.frequencies, from: bands)
+            mode = .basic
+        case .bands31:
+            bands = retargetedBands(for: EqualizerMode.expert.frequencies, from: bands)
+            mode = .expert
+        case .custom:
+            if currentLayout != .custom {
+                bands.append(EqualizerBand(
+                    frequency: suggestedCustomBandFrequency(in: bands),
+                    gain: 0,
+                    q: 0.5,
+                    isCustom: true
+                ))
+                sortBands(&bands)
+                mode = .advanced
+            }
+        }
+
         applyAutoGainIfNeeded()
         saveMainManualProfileIfNeeded()
         syncLinkedEQNodes()
@@ -1373,6 +1519,14 @@ final class EqualizerModel: ObservableObject {
             setEQNodeMode(id: nodeID, mode: newMode)
         } else {
             setMode(newMode)
+        }
+    }
+
+    func setActiveEQBandLayout(_ layout: EqualizerBandLayout) {
+        if let nodeID = activeEQNode?.id {
+            setEQNodeBandLayout(id: nodeID, layout: layout)
+        } else {
+            setBandLayout(layout)
         }
     }
 
@@ -1606,10 +1760,12 @@ final class EqualizerModel: ObservableObject {
 
         let virtualCapture = virtualCaptureDeviceForEngine
         let switchedDefaultToVirtual = virtualCapture != nil ? switchSystemDefaultToVirtualOutputForEngine() : false
+        let configuration = audioEngineConfiguration
+        let outputDeviceIDs = resolvedOutputDeviceIDs(for: configuration)
         do {
             try audioEngine.startRendering(
-                configuration: audioEngineConfiguration,
-                outputDeviceID: renderOutputDevice?.audioObjectID,
+                configuration: configuration,
+                outputDeviceIDsByUID: outputDeviceIDs,
                 captureDeviceID: virtualCapture?.audioObjectID
             )
             lastAutoStartFailureSignature = nil
@@ -1673,6 +1829,17 @@ final class EqualizerModel: ObservableObject {
         selectedOutputName = newValue
     }
 
+    private func resolvedOutputDeviceIDs(for configuration: AudioEngineConfiguration) -> [String: AudioDeviceID] {
+        var deviceIDsByUID: [String: AudioDeviceID] = [:]
+        for target in configuration.renderTargets {
+            guard let device = hardwareOutputDevices.first(where: { $0.uid == target.outputUID }) else {
+                continue
+            }
+            deviceIDsByUID[target.outputUID] = device.audioObjectID
+        }
+        return deviceIDsByUID
+    }
+
     private func restartAudioEngineIfNeeded() {
         guard audioEngineRunState == .running else {
             scheduleAutoStartIfNeeded()
@@ -1718,6 +1885,18 @@ final class EqualizerModel: ObservableObject {
 
     private var autoStartSignature: String {
         let configuration = audioEngineConfiguration
+        let renderTargetSignature = configuration.renderTargets
+            .map { target in
+                [
+                    target.outputUID,
+                    String(target.routeCount),
+                    String(format: "%.2f", target.preamp),
+                    String(format: "%.2f", target.balance),
+                    String(target.filters.count)
+                ].joined(separator: ":")
+            }
+            .sorted()
+            .joined(separator: "|")
         let connectionSignature = routingConnections
             .map { "\($0.from.uuidString):\($0.to.uuidString)" }
             .sorted()
@@ -1744,6 +1923,7 @@ final class EqualizerModel: ObservableObject {
             "\(configuration.filters.count)",
             "\(configuration.mutesOriginalAudio)",
             "\(powerEnabled)",
+            renderTargetSignature,
             nodeSignature,
             connectionSignature
         ].joined(separator: "#")
@@ -1920,7 +2100,12 @@ final class EqualizerModel: ObservableObject {
         schedulePersistedStateSave()
     }
 
-    func addOutputRoutingNode(uid: String?) {
+    func addOutputRoutingNode(
+        uid: String?,
+        restartEngine: Bool = true,
+        scheduleSave: Bool = true,
+        selectNode: Bool = true
+    ) {
         let device = uid.flatMap { targetUID in hardwareOutputDevices.first(where: { $0.uid == targetUID }) }
         let outputCount = routingNodes.filter { $0.kind == .output }.count
         let outputPosition = CGPoint(x: 910, y: 310 + CGFloat(outputCount * 154))
@@ -1932,9 +2117,15 @@ final class EqualizerModel: ObservableObject {
             audioOutputUID: device?.uid
         )
         routingNodes.append(node)
-        selectedRoutingNodeID = node.id
-        restartAudioEngineIfNeeded()
-        schedulePersistedStateSave()
+        if selectNode {
+            selectedRoutingNodeID = node.id
+        }
+        if restartEngine {
+            restartAudioEngineIfNeeded()
+        }
+        if scheduleSave {
+            schedulePersistedStateSave()
+        }
     }
 
     func removeRoutingNode(id: RoutingNode.ID) {
@@ -2058,7 +2249,35 @@ final class EqualizerModel: ObservableObject {
 
     func setEQNodeMode(id: RoutingNode.ID, mode newMode: EqualizerMode) {
         updateEQNode(id: id) { node in
+            node.eqBands = retargetedBands(for: newMode.frequencies, from: node.eqBands)
             node.eqMode = newMode
+            applyAutoGainIfNeeded(to: &node)
+            saveManualProfileIfNeeded(for: &node)
+        }
+    }
+
+    func setEQNodeBandLayout(id: RoutingNode.ID, layout: EqualizerBandLayout) {
+        updateEQNode(id: id) { node in
+            let currentLayout = bandLayout(for: node.eqMode, bands: node.eqBands)
+            switch layout {
+            case .bands10:
+                node.eqBands = retargetedBands(for: EqualizerMode.basic.frequencies, from: node.eqBands)
+                node.eqMode = .basic
+            case .bands31:
+                node.eqBands = retargetedBands(for: EqualizerMode.expert.frequencies, from: node.eqBands)
+                node.eqMode = .expert
+            case .custom:
+                if currentLayout != .custom {
+                    node.eqBands.append(EqualizerBand(
+                        frequency: suggestedCustomBandFrequency(in: node.eqBands),
+                        gain: 0,
+                        q: 0.5,
+                        isCustom: true
+                    ))
+                    sortBands(&node.eqBands)
+                    node.eqMode = .advanced
+                }
+            }
             applyAutoGainIfNeeded(to: &node)
             saveManualProfileIfNeeded(for: &node)
         }
@@ -2317,9 +2536,29 @@ final class EqualizerModel: ObservableObject {
         pollTimer = timer
     }
 
+    private func startLifecycleRefreshObservers() {
+        let notifications: [(NotificationCenter, Notification.Name)] = [
+            (NotificationCenter.default, NSApplication.didBecomeActiveNotification),
+            (NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification)
+        ]
+
+        lifecycleObservers = notifications.map { center, name in
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshAudioSources()
+                    self?.refreshAudioDevices()
+                }
+            }
+            return (center, observer)
+        }
+    }
+
     private func startEngineTelemetryPolling() {
         engineTelemetryTimer?.invalidate()
-        let interval = highFrameRateUIEnabled ? (1.0 / 60.0) : (1.0 / 18.0)
+        let hasVisibleGraphicalSurface = !visibleGraphicalSurfaceIDs.isEmpty
+        let interval = hasVisibleGraphicalSurface
+            ? (highFrameRateUIEnabled ? (1.0 / 60.0) : (1.0 / 18.0))
+            : 1.0
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshAudioEngineTelemetry()
@@ -2338,6 +2577,9 @@ final class EqualizerModel: ObservableObject {
     private func refreshAudioEngineTelemetry() {
         let snapshot = audioEngine.telemetry
         audioEngineTelemetry = snapshot
+        guard !visibleGraphicalSurfaceIDs.isEmpty else {
+            return
+        }
         telemetryStore.publish(snapshot, smoothMeters: highFrameRateUIEnabled)
     }
 
@@ -2437,15 +2679,109 @@ final class EqualizerModel: ObservableObject {
         Set([defaultOutputUID, defaultSystemOutputUID].compactMap(\.self))
     }
 
-    private func bandLayoutTitle(for mode: EqualizerMode) -> String {
-        switch mode {
-        case .basic:
-            return "10 Bands"
-        case .advanced:
-            return "15 Bands"
-        case .expert:
-            return "31 Bands"
+    private func routedHardwareOutputUIDs() -> Set<String> {
+        let nodeByID = Dictionary(uniqueKeysWithValues: routingNodes.map { ($0.id, $0) })
+        let sourceIDs = routingNodes.filter { $0.kind == .source }.map(\.id)
+        let outputNodeIDs = Set(routingNodes.filter { $0.kind == .output }.map(\.id))
+        let adjacency = Dictionary(grouping: routingConnections, by: \.from)
+        var outputUIDs = Set<String>()
+
+        func walk(currentID: RoutingNode.ID, visited: Set<RoutingNode.ID>) {
+            guard !visited.contains(currentID) else { return }
+            if outputNodeIDs.contains(currentID),
+               let node = nodeByID[currentID],
+               let uid = node.audioOutputUID ?? renderOutputDevice?.uid,
+               hardwareOutputDevices.contains(where: { $0.uid == uid }) {
+                outputUIDs.insert(uid)
+                return
+            }
+
+            var nextVisited = visited
+            nextVisited.insert(currentID)
+            for connection in adjacency[currentID, default: []] {
+                walk(currentID: connection.to, visited: nextVisited)
+            }
         }
+
+        for sourceID in sourceIDs {
+            walk(currentID: sourceID, visited: [])
+        }
+        return outputUIDs
+    }
+
+    private func bandLayout(for mode: EqualizerMode, bands sourceBands: [EqualizerBand]) -> EqualizerBandLayout {
+        if mode == .basic, matchesLayout(sourceBands, frequencies: EqualizerMode.basic.frequencies) {
+            return .bands10
+        }
+        if mode == .expert, matchesLayout(sourceBands, frequencies: EqualizerMode.expert.frequencies) {
+            return .bands31
+        }
+        if matchesLayout(sourceBands, frequencies: EqualizerMode.basic.frequencies) {
+            return .bands10
+        }
+        if matchesLayout(sourceBands, frequencies: EqualizerMode.expert.frequencies) {
+            return .bands31
+        }
+        return .custom
+    }
+
+    private func matchesLayout(_ sourceBands: [EqualizerBand], frequencies: [Double]) -> Bool {
+        let sorted = sortedBands(sourceBands)
+        guard sorted.count == frequencies.count,
+              !sorted.contains(where: \.isCustom) else {
+            return false
+        }
+
+        return zip(sorted, frequencies).allSatisfy { band, frequency in
+            abs(band.frequency - frequency) < 0.01 && abs(band.slotFrequency - frequency) < 0.01
+        }
+    }
+
+    private func hasCustomBandConfiguration(_ sourceBands: [EqualizerBand]) -> Bool {
+        sourceBands.contains { band in
+            band.isCustom || abs(band.frequency - band.slotFrequency) >= 0.01
+        }
+    }
+
+    private func retargetedBands(for frequencies: [Double], from sourceBands: [EqualizerBand]) -> [EqualizerBand] {
+        guard !frequencies.isEmpty else {
+            return sortedBands(sourceBands)
+        }
+
+        var targetBands = frequencies.map { EqualizerBand(slotFrequency: $0, frequency: $0) }
+        if shouldPreserveExactBandsWhenExpanding(from: sourceBands, to: frequencies) {
+            for index in targetBands.indices {
+                guard let sourceBand = exactBand(at: targetBands[index].frequency, in: sourceBands) else {
+                    continue
+                }
+                copyBandSettings(from: sourceBand, to: &targetBands[index])
+            }
+        } else {
+            retargetBands(&targetBands, from: sourceBands)
+        }
+        return sortedBands(targetBands)
+    }
+
+    private func shouldPreserveExactBandsWhenExpanding(from sourceBands: [EqualizerBand], to frequencies: [Double]) -> Bool {
+        guard frequencies.count >= sourceBands.count else {
+            return false
+        }
+
+        return sourceBands.allSatisfy { sourceBand in
+            frequencies.contains { abs($0 - sourceBand.frequency) < 0.01 }
+        }
+    }
+
+    private func exactBand(at frequency: Double, in sourceBands: [EqualizerBand]) -> EqualizerBand? {
+        sourceBands.first { abs($0.frequency - frequency) < 0.01 }
+    }
+
+    private func copyBandSettings(from sourceBand: EqualizerBand, to targetBand: inout EqualizerBand) {
+        targetBand.gain = sourceBand.gain
+        targetBand.q = sourceBand.q
+        targetBand.isEnabled = sourceBand.isEnabled
+        targetBand.isStereoLinked = sourceBand.isStereoLinked
+        targetBand.shape = sourceBand.shape
     }
 
     private func saveMainManualProfileIfNeeded() {
@@ -2754,6 +3090,41 @@ final class EqualizerModel: ObservableObject {
         activeEQNodeID = eqNode.id
     }
 
+    private func integrateLegacyPureQBusNodes() {
+        let legacyBusIDs = routingNodes
+            .filter { $0.kind == .bus && $0.isProtected && $0.title == "PureQ Bus" }
+            .map(\.id)
+        guard !legacyBusIDs.isEmpty else { return }
+
+        for busID in legacyBusIDs {
+            let incomingIDs = routingConnections
+                .filter { $0.to == busID }
+                .map(\.from)
+            let outgoingIDs = routingConnections
+                .filter { $0.from == busID }
+                .map(\.to)
+
+            routingConnections.removeAll { $0.from == busID || $0.to == busID }
+            for sourceID in incomingIDs {
+                for targetID in outgoingIDs where sourceID != targetID {
+                    let connection = RoutingConnection(from: sourceID, to: targetID)
+                    if isValidRoutingConnection(connection),
+                       !routingConnections.contains(where: { $0.from == sourceID && $0.to == targetID }) {
+                        routingConnections.append(connection)
+                    }
+                }
+            }
+        }
+
+        routingNodes.removeAll { legacyBusIDs.contains($0.id) }
+        if let selectedRoutingNodeID, legacyBusIDs.contains(selectedRoutingNodeID) {
+            self.selectedRoutingNodeID = nil
+        }
+        if let patchStartNodeID, legacyBusIDs.contains(patchStartNodeID) {
+            self.patchStartNodeID = nil
+        }
+    }
+
     private func seedRoutingGraphIfNeeded() {
         guard routingNodes.isEmpty else { return }
 
@@ -2765,12 +3136,11 @@ final class EqualizerModel: ObservableObject {
             audioSourceID: AudioSourceItem.systemMixID,
             isProtected: true
         )
-        let bus = RoutingNode(title: "PureQ Bus", subtitle: "Stereo bus", kind: .bus, position: CGPoint(x: 400, y: 150), isProtected: true)
         let eq = RoutingNode(
             title: "Equalizer",
-            subtitle: "\(mode.rawValue) / \(visibleBands.count) bands",
+            subtitle: "\(activeEQBandLayoutTitle) / \(visibleBands.count) bands",
             kind: .equalizer,
-            position: CGPoint(x: 655, y: 150),
+            position: CGPoint(x: 400, y: 150),
             isProtected: true,
             eqMode: mode,
             eqSelection: selection,
@@ -2779,12 +3149,11 @@ final class EqualizerModel: ObservableObject {
             eqBands: bands,
             eqUsesMainEqualizer: false
         )
-        let guardNode = RoutingNode(title: "Output Guard", subtitle: lockStatus.title, kind: .guardNode, position: CGPoint(x: 910, y: 150), isProtected: true)
+        let guardNode = RoutingNode(title: "Output Guard", subtitle: lockStatus.title, kind: .guardNode, position: CGPoint(x: 655, y: 150), isProtected: true)
 
-        routingNodes = [source, bus, eq, guardNode]
+        routingNodes = [source, eq, guardNode]
         routingConnections = [
-            RoutingConnection(from: source.id, to: bus.id),
-            RoutingConnection(from: bus.id, to: eq.id),
+            RoutingConnection(from: source.id, to: eq.id),
             RoutingConnection(from: eq.id, to: guardNode.id)
         ]
         activeEQNodeID = eq.id
@@ -2822,9 +3191,10 @@ final class EqualizerModel: ObservableObject {
                 let visibleCount = visibleEQBands(for: routingNodes[index]).count
                 let activeCount = routingNodes[index].eqBands.filter { $0.isEnabled && abs($0.gain) > 0.01 }.count
                 let linkLabel = routingNodes[index].eqUsesMainEqualizer ? "Main" : "Unique"
+                let layoutLabel = bandLayout(for: routingNodes[index].eqMode, bands: routingNodes[index].eqBands).title
                 setRoutingNodeSubtitleIfNeeded(
                     at: index,
-                    subtitle: "\(linkLabel) / \(routingNodes[index].eqMode.rawValue) / \(visibleCount) bands / \(activeCount) active"
+                    subtitle: "\(linkLabel) / \(layoutLabel) / \(visibleCount) bands / \(activeCount) active"
                 )
             case .guardNode:
                 setRoutingNodeSubtitleIfNeeded(at: index, subtitle: lockStatus.title)
@@ -2846,15 +3216,15 @@ final class EqualizerModel: ObservableObject {
             }
         }
 
-        let outputUID = renderOutputDevice?.uid
-        guard let outputUID else { return }
-
-        if !routingNodes.contains(where: { $0.audioOutputUID == outputUID }) {
-            addOutputRoutingNode(uid: outputUID)
+        guard !routingNodes.contains(where: { $0.kind == .output }),
+              let outputUID = renderOutputDevice?.uid else {
+            return
         }
 
+        addOutputRoutingNode(uid: outputUID, restartEngine: false, scheduleSave: false, selectNode: false)
+
         guard let guardNode = routingNodes.first(where: { $0.kind == .guardNode }),
-              let outputNode = routingNodes.first(where: { $0.audioOutputUID == outputUID }) else {
+              let outputNode = routingNodes.first(where: { $0.kind == .output }) else {
             return
         }
 

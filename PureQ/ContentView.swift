@@ -31,6 +31,7 @@ struct ContentView: View {
     @EnvironmentObject private var model: EqualizerModel
     @State private var selectedWorkspace: WorkspaceTab = .equalizer
     @State private var showingConsole = false
+    @State private var graphicalSurfaceID = UUID()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -60,6 +61,12 @@ struct ContentView: View {
         .background(Color.pureQBackground)
         .foregroundStyle(.white.opacity(0.88))
         .background(ClickOutsideEditableTextFieldObserver())
+        .onAppear {
+            model.setGraphicalSurface(id: graphicalSurfaceID, visible: true)
+        }
+        .onDisappear {
+            model.setGraphicalSurface(id: graphicalSurfaceID, visible: false)
+        }
         .onChange(of: model.readinessSummary) { _, newValue in
             if newValue == .blocked {
                 showingConsole = true
@@ -470,28 +477,74 @@ struct EqualizerWorkspace: View {
 
 struct EqualizerGraphHost: View {
     @EnvironmentObject private var model: EqualizerModel
+    @EnvironmentObject private var telemetryStore: AudioTelemetryStore
 
     var body: some View {
         GeometryReader { proxy in
             let graphSize = graphSize(for: proxy.size)
-            HStack {
-                Spacer(minLength: 12)
-                EqualizerGraph(bands: model.activeEQGraphBands, preamp: model.activeEQPreamp)
-                    .pureQHardwareAccelerated(model.highFrameRateUIEnabled)
-                    .frame(width: graphSize.width, height: graphSize.height)
-                Spacer(minLength: 12)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 10) {
+                    Spacer(minLength: 12)
+                    graph(size: graphSize)
+                    SpectrumToggle(isEnabled: $model.spectrumAnalyzerEnabled)
+                        .padding(.top, 2)
+                    Spacer(minLength: 12)
+                }
+
+                VStack(spacing: 8) {
+                    graph(size: graphSize)
+                    SpectrumToggle(isEnabled: $model.spectrumAnalyzerEnabled)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .padding(.top, 8)
+            .padding(.top, 10)
         }
-        .frame(minHeight: 230, idealHeight: 330, maxHeight: 410)
+        .frame(minHeight: 310, idealHeight: 445, maxHeight: 555)
         .background(Color.pureQBackground)
     }
 
+    private func graph(size: CGSize) -> some View {
+        EqualizerGraph(
+            bands: model.activeEQGraphBands,
+            preamp: model.activeEQPreamp,
+            spectrumLevels: model.spectrumAnalyzerEnabled ? telemetryStore.telemetry.spectrumLevels : []
+        )
+        .pureQHardwareAccelerated(model.highFrameRateUIEnabled || model.spectrumAnalyzerEnabled)
+        .frame(width: size.width, height: size.height)
+    }
+
     private func graphSize(for availableSize: CGSize) -> CGSize {
-        let height = min(max(availableSize.height - 16, 220), 360)
-        let width = min(max(height * 1.55, 420), min(availableSize.width - 24, 760))
-        return CGSize(width: max(width, 320), height: height)
+        let height = min(max(availableSize.height - 28, 300), 486)
+        let availableWidth = max(320, availableSize.width - 112)
+        let width = min(max(height * 1.55, 565), min(availableWidth, 1_026))
+        return CGSize(width: max(width, 420), height: height)
+    }
+}
+
+struct SpectrumToggle: View {
+    @Binding var isEnabled: Bool
+
+    var body: some View {
+        Button {
+            isEnabled.toggle()
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 17, weight: .bold))
+                Text("FFT")
+                    .font(.caption2.weight(.bold))
+            }
+            .foregroundStyle(isEnabled ? Color.pureQGreen : .white.opacity(0.82))
+            .frame(width: 54, height: 52)
+            .background(isEnabled ? Color.pureQGreen.opacity(0.16) : Color.pureQControl, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isEnabled ? Color.pureQGreen.opacity(0.48) : Color.pureQStroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Toggle FFT spectrum analyzer")
+        .accessibilityLabel("Toggle FFT spectrum analyzer")
     }
 }
 
@@ -1017,7 +1070,7 @@ struct RoutingToolbar: View {
             .buttonStyle(RouteToolbarButtonStyle())
 
             Menu {
-                ForEach(RoutingNodeKind.allCases.filter { $0 != .source && $0 != .output && $0 != .monitor }) { kind in
+                ForEach(RoutingNodeKind.allCases.filter { $0 != .source && $0 != .bus && $0 != .output && $0 != .monitor }) { kind in
                     Button {
                         model.addRoutingNode(kind: kind)
                     } label: {
@@ -1473,7 +1526,9 @@ struct RoutingInspector: View {
                         }, set: { kind in
                             model.setRoutingNodeKind(id: node.id, kind: kind)
                         })) {
-                            ForEach(RoutingNodeKind.allCases.filter { node.kind == .monitor || $0 != .monitor }) { kind in
+                            ForEach(RoutingNodeKind.allCases.filter { kind in
+                                kind != .bus && (node.kind == .monitor || kind != .monitor)
+                            }) { kind in
                                 Text(kind.title).tag(kind)
                             }
                         }
@@ -1636,7 +1691,7 @@ struct RoutingInspector: View {
 
     private func eqSummary(for node: RoutingNode) -> String {
         let activeCount = node.eqBands.filter { $0.isEnabled && abs($0.gain) > 0.01 }.count
-        return "\(node.eqMode.rawValue), \(activeCount) active"
+        return "\(model.eqBandLayoutTitle(for: node)), \(activeCount) active"
     }
 }
 
@@ -1766,6 +1821,7 @@ struct PresetBar: View {
 struct EqualizerGraph: View {
     let bands: [EqualizerBand]
     let preamp: Double
+    var spectrumLevels: [Double] = []
 
     private let minimumFrequency = 20.0
     private let maximumFrequency = 20_000.0
@@ -1777,6 +1833,7 @@ struct EqualizerGraph: View {
             let plot = CGRect(x: 54, y: 18, width: max(size.width - 108, 10), height: max(size.height - 56, 10))
 
             drawGrid(in: plot, context: &context)
+            drawSpectrum(in: plot, context: &context)
             drawCurve(in: plot, context: &context)
         }
         .background(Color.pureQBackground)
@@ -1827,6 +1884,58 @@ struct EqualizerGraph: View {
                 anchor: .center
             )
         }
+    }
+
+    private func drawSpectrum(in plot: CGRect, context: inout GraphicsContext) {
+        guard !spectrumLevels.isEmpty else { return }
+
+        let binCount = spectrumLevels.count
+        let minLog = log10(minimumFrequency)
+        let maxLog = log10(maximumFrequency)
+        var outline = Path()
+
+        for index in spectrumLevels.indices {
+            let lowerFraction = Double(index) / Double(binCount)
+            let upperFraction = Double(index + 1) / Double(binCount)
+            let centerFraction = (lowerFraction + upperFraction) * 0.5
+            let lowerFrequency = pow(10, minLog + ((maxLog - minLog) * lowerFraction))
+            let upperFrequency = pow(10, minLog + ((maxLog - minLog) * upperFraction))
+            let centerFrequency = pow(10, minLog + ((maxLog - minLog) * centerFraction))
+            let level = spectrumLevels[index].clamped(to: 0...1)
+            let x1 = xPosition(for: lowerFrequency, in: plot)
+            let x2 = xPosition(for: upperFrequency, in: plot)
+            let height = plot.height * CGFloat(level)
+            let width = max(1, x2 - x1)
+            let barRect = CGRect(x: x1, y: plot.maxY - height, width: width, height: height)
+
+            context.fill(
+                Path(roundedRect: barRect, cornerRadius: min(width * 0.35, 3)),
+                with: .linearGradient(
+                    Gradient(colors: [
+                        Color.pureQGreen.opacity(0.08),
+                        Color.pureQGreen.opacity(0.26)
+                    ]),
+                    startPoint: CGPoint(x: barRect.midX, y: plot.maxY),
+                    endPoint: CGPoint(x: barRect.midX, y: barRect.minY)
+                )
+            )
+
+            let point = CGPoint(
+                x: xPosition(for: centerFrequency, in: plot),
+                y: plot.maxY - height
+            )
+            if index == spectrumLevels.startIndex {
+                outline.move(to: point)
+            } else {
+                outline.addLine(to: point)
+            }
+        }
+
+        context.stroke(
+            outline,
+            with: .color(Color.pureQGreen.opacity(0.42)),
+            style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round)
+        )
     }
 
     private func drawCurve(in plot: CGRect, context: inout GraphicsContext) {
@@ -2062,11 +2171,16 @@ struct BandLayoutMenu: View {
 
     var body: some View {
         Menu {
-            Button("10 Bands") {
-                model.setActiveEQMode(.basic)
-            }
-            Button("31 Bands") {
-                model.setActiveEQMode(.expert)
+            ForEach(EqualizerBandLayout.allCases) { layout in
+                Button {
+                    model.setActiveEQBandLayout(layout)
+                } label: {
+                    if model.activeEQBandLayout == layout {
+                        Label(layout.title, systemImage: "checkmark")
+                    } else {
+                        Text(layout.title)
+                    }
+                }
             }
         } label: {
             HStack(spacing: 8) {
@@ -2271,7 +2385,11 @@ struct BandValueField: View {
                     .minimumScaleFactor(0.72)
             }
 
-            TextField("", text: $text)
+            TextField("", text: Binding(get: {
+                isFocused ? text : formattedText(from: value)
+            }, set: { newText in
+                text = newText
+            }))
                 .textFieldStyle(.plain)
                 .font((compact ? Font.caption2 : Font.caption).monospacedDigit().weight(.bold))
                 .multilineTextAlignment(.trailing)
@@ -2303,7 +2421,8 @@ struct BandValueField: View {
         }
         .onChange(of: isFocused) { _, focused in
             if focused {
-                text = trimmedNumberText(from: text)
+                let currentText = text.isEmpty ? formattedText(from: value) : text
+                text = trimmedNumberText(from: currentText)
             } else {
                 commit()
             }
@@ -2322,10 +2441,14 @@ struct BandValueField: View {
     }
 
     private func updateText(from value: Double) {
+        text = formattedText(from: value)
+    }
+
+    private func formattedText(from value: Double) -> String {
         if decimals == 0 {
-            text = String(format: "%.0f", value)
+            return String(format: "%.0f", value)
         } else {
-            text = String(format: "%.\(decimals)f", value)
+            return String(format: "%.\(decimals)f", value)
         }
     }
 
@@ -2618,102 +2741,248 @@ struct TelemetryFooterText: View {
 
 struct MenuBarView: View {
     @EnvironmentObject private var model: EqualizerModel
+    @State private var graphicalSurfaceID = UUID()
+
+    private let popoverWidth: CGFloat = 430
+    private let popoverHeight: CGFloat = 640
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("PureQ", systemImage: model.menuBarSystemImage)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(model.lockStatus.tint)
-                Spacer()
-                Toggle("", isOn: $model.powerEnabled)
-                    .toggleStyle(PowerToggleStyle())
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Desired Output")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Picker("Desired Output", selection: Binding(get: {
-                    model.selectedOutputUID ?? ""
-                }, set: { uid in
-                    model.selectedOutputUID = uid.isEmpty ? nil : uid
-                })) {
-                    if let selectedUID = model.selectedOutputUID,
-                       !model.hardwareOutputDevices.contains(where: { $0.uid == selectedUID }) {
-                        Text("\(model.selectedOutputName) (disconnected)").tag(selectedUID)
+        VStack(spacing: 0) {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Label("PureQ", systemImage: model.menuBarSystemImage)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(model.lockStatus.tint)
+                        Spacer()
+                        Toggle("", isOn: $model.powerEnabled)
+                            .toggleStyle(PowerToggleStyle())
                     }
-                    ForEach(model.hardwareOutputDevices) { device in
-                        Text(device.name).tag(device.uid)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Desired Output")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        Picker("Desired Output", selection: Binding(get: {
+                            model.selectedOutputUID ?? ""
+                        }, set: { uid in
+                            model.selectedOutputUID = uid.isEmpty ? nil : uid
+                        })) {
+                            if let selectedUID = model.selectedOutputUID,
+                               !model.hardwareOutputDevices.contains(where: { $0.uid == selectedUID }) {
+                                Text("\(model.selectedOutputName) (disconnected)").tag(selectedUID)
+                            }
+                            ForEach(model.hardwareOutputDevices) { device in
+                                Text(device.name).tag(device.uid)
+                            }
+                        }
+                        .labelsHidden()
+
+                        Toggle("Lock output", isOn: $model.outputLockEnabled)
+                            .toggleStyle(.switch)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Preset")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(model.activeEQSelection.title)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Picker("Preset", selection: Binding(get: {
+                            model.activeEQSelection
+                        }, set: { selection in
+                            model.applyActiveEQSelection(selection)
+                        })) {
+                            ForEach(EqualizerSelection.profileOptions) { selection in
+                                Text(selection.title).tag(selection)
+                            }
+                        }
+                        .labelsHidden()
+
+                        BandLayoutMenu()
+
+                        Slider(value: Binding(get: {
+                            model.activeEQPreamp
+                        }, set: { value in
+                            model.setActiveEQPreamp(value)
+                        }), in: -20...20) {
+                            Text("Preamp")
+                        }
+                        .tint(Color.pureQGreen)
+
+                        Toggle("Auto preamp", isOn: Binding(get: {
+                            model.activeEQAutoGainEnabled
+                        }, set: { enabled in
+                            model.setActiveEQAutoGain(enabled)
+                        }))
+                        .toggleStyle(.switch)
+                    }
+
+                    MenuBarEQBandPanel()
+
+                    Text(model.lockMessage)
+                        .font(.caption)
+                        .foregroundStyle(model.lockStatus.tint)
+                        .lineLimit(2)
+
+                    HStack {
+                        Button("Refresh") {
+                            model.refreshAudioDevices()
+                        }
+                        Spacer()
+                        Button("Open PureQ") {
+                            PureQWindowController.shared.showMainWindow()
+                        }
+                        .keyboardShortcut("o")
                     }
                 }
-                .labelsHidden()
-
-                Toggle("Lock output", isOn: $model.outputLockEnabled)
-                    .toggleStyle(.switch)
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Preset")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(model.activeEQSelection.title)
-                        .foregroundStyle(.secondary)
-                }
-
-                Picker("Preset", selection: Binding(get: {
-                    model.activeEQSelection
-                }, set: { selection in
-                    model.applyActiveEQSelection(selection)
-                })) {
-                    ForEach(EqualizerSelection.profileOptions) { selection in
-                        Text(selection.title).tag(selection)
-                    }
-                }
-                .labelsHidden()
-
-                BandLayoutMenu()
-
-                Slider(value: Binding(get: {
-                    model.activeEQPreamp
-                }, set: { value in
-                    model.setActiveEQPreamp(value)
-                }), in: -20...20) {
-                    Text("Preamp")
-                }
-                .tint(Color.pureQGreen)
-
-                Toggle("Auto preamp", isOn: Binding(get: {
-                    model.activeEQAutoGainEnabled
-                }, set: { enabled in
-                    model.setActiveEQAutoGain(enabled)
-                }))
-                .toggleStyle(.switch)
-            }
-
-            Text(model.lockMessage)
-                .font(.caption)
-                .foregroundStyle(model.lockStatus.tint)
-                .lineLimit(2)
-
-            HStack {
-                Button("Refresh") {
-                    model.refreshAudioDevices()
-                }
-                Spacer()
-                Button("Open PureQ") {
-                    PureQWindowController.shared.showMainWindow()
-                }
-                .keyboardShortcut("o")
+                .padding(16)
             }
         }
-        .padding(16)
-        .frame(width: 360)
+        .frame(width: popoverWidth, height: popoverHeight)
+        .background(Color.pureQBackground)
+        .onAppear {
+            model.setGraphicalSurface(id: graphicalSurfaceID, visible: true)
+        }
+        .onDisappear {
+            model.setGraphicalSurface(id: graphicalSurfaceID, visible: false)
+        }
+    }
+}
+
+struct MenuBarEQBandPanel: View {
+    @EnvironmentObject private var model: EqualizerModel
+    @EnvironmentObject private var telemetryStore: AudioTelemetryStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            EqualizerGraph(
+                bands: model.activeEQGraphBands,
+                preamp: model.activeEQPreamp,
+                spectrumLevels: model.spectrumAnalyzerEnabled ? telemetryStore.telemetry.spectrumLevels : []
+            )
+                .frame(height: 148)
+                .background(Color.pureQBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.pureQStroke, lineWidth: 1)
+                )
+
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: 7) {
+                    ForEach(model.activeEQVisibleBands) { band in
+                        MenuBarBandStrip(
+                            band: band,
+                            onFrequencyChange: { model.setActiveEQBandFrequency(id: band.id, frequency: $0) },
+                            onGainChange: { model.setActiveEQBandGain(id: band.id, gain: $0, persist: false) },
+                            onGainCommit: { model.setActiveEQBandGain(id: band.id, gain: $0, persist: true) },
+                            onQCommit: { model.setActiveEQBandQ(id: band.id, q: $0, persist: true) },
+                            onToggleEnabled: { model.toggleActiveEQBand(id: band.id) },
+                            onCycleShape: { model.cycleActiveEQShape(id: band.id) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.bottom, 4)
+            }
+            .frame(height: 230)
+        }
+    }
+}
+
+struct MenuBarBandStrip: View {
+    let band: EqualizerBand
+    let onFrequencyChange: (Double) -> Void
+    let onGainChange: (Double) -> Void
+    let onGainCommit: (Double) -> Void
+    let onQCommit: (Double) -> Void
+    let onToggleEnabled: () -> Void
+    let onCycleShape: () -> Void
+
+    var body: some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 4) {
+                Button(action: onToggleEnabled) {
+                    Image(systemName: band.isEnabled ? "checkmark" : "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                .buttonStyle(MiniToggleButtonStyle(active: band.isEnabled))
+                .help(band.isEnabled ? "Disable band" : "Enable band")
+
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(colorForBand)
+                    .frame(width: 17, height: 17)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .stroke(.black.opacity(0.45), lineWidth: 1.5)
+                    )
+            }
+
+            Button(action: onCycleShape) {
+                Image(systemName: band.shape.systemImage)
+            }
+            .buttonStyle(PillButtonStyle(active: true))
+            .help("Cycle filter shape")
+
+            BandValueField(
+                value: band.frequency,
+                range: 20...20_000,
+                suffix: "Hz",
+                decimals: band.frequency >= 1_000 ? 0 : 1,
+                compact: true,
+                onCommit: onFrequencyChange
+            )
+
+            VerticalFader(
+                value: band.gain,
+                range: -20...20,
+                meterFrequency: band.frequency,
+                isEnabled: band.isEnabled,
+                onChange: onGainChange,
+                onEditingEnded: onGainCommit
+            )
+            .frame(height: 104)
+            .opacity(band.isEnabled ? 1 : 0.36)
+
+            BandValueField(
+                value: band.gain,
+                range: -20...20,
+                suffix: "dB",
+                decimals: 1,
+                compact: true,
+                onCommit: onGainCommit
+            )
+
+            BandValueField(
+                value: band.q,
+                range: 0.1...10,
+                prefix: "Q:",
+                suffix: "",
+                decimals: 3,
+                compact: true,
+                onCommit: onQCommit
+            )
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 6)
+        .frame(width: 62, height: 222)
+        .background(Color(red: 0.20, green: 0.21, blue: 0.23), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.pureQStroke, lineWidth: 1)
+        )
+    }
+
+    private var colorForBand: Color {
+        let fraction = min(max((log10(band.frequency) - log10(20)) / (log10(20_000) - log10(20)), 0), 1)
+        return Color(hue: 0.04 + fraction * 0.12, saturation: 0.95, brightness: 1.0)
     }
 }
 
@@ -2827,9 +3096,13 @@ struct PillButtonStyle: ButtonStyle {
 }
 
 private extension View {
+    @ViewBuilder
     func pureQHardwareAccelerated(_ enabled: Bool) -> some View {
-        _ = enabled
-        return self
+        if enabled {
+            self.drawingGroup(opaque: false, colorMode: .linear)
+        } else {
+            self
+        }
     }
 }
 

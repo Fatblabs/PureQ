@@ -4,6 +4,7 @@
 //
 
 import AudioToolbox
+import Accelerate
 import AVFoundation
 import CoreAudio
 import Darwin
@@ -65,6 +66,7 @@ struct AudioEngineFilterDescriptor: Equatable {
 }
 
 struct AudioEngineSourceRoute: Equatable {
+    let sourceNodeID: RoutingNode.ID
     let sourceID: String
     let title: String
     let bundleIdentifier: String?
@@ -73,6 +75,7 @@ struct AudioEngineSourceRoute: Equatable {
 }
 
 struct AudioEngineRoutePlan: Equatable {
+    let sourceNodeID: RoutingNode.ID
     let sourceID: String
     let title: String
     let bundleIdentifier: String?
@@ -85,6 +88,15 @@ struct AudioEngineRoutePlan: Equatable {
     let preamp: Double
 }
 
+struct AudioEngineRenderTarget: Equatable {
+    let outputUID: String
+    let outputName: String
+    let routeCount: Int
+    let filters: [AudioEngineFilterDescriptor]
+    let preamp: Double
+    let balance: Double
+}
+
 struct AudioEngineConfiguration: Equatable {
     let enabled: Bool
     let filters: [AudioEngineFilterDescriptor]
@@ -92,10 +104,12 @@ struct AudioEngineConfiguration: Equatable {
     let balance: Double
     let sourceRoutes: [AudioEngineSourceRoute]
     let routePlans: [AudioEngineRoutePlan]
+    let renderTargets: [AudioEngineRenderTarget]
     let outputUID: String?
     let outputName: String
     let virtualCaptureUID: String?
     let virtualCaptureName: String?
+    let spectrumAnalyzerEnabled: Bool
     let nodeCount: Int
     let connectionCount: Int
     let mutesOriginalAudio: Bool
@@ -109,6 +123,7 @@ struct AudioEngineTelemetry: Equatable {
     let inputCallbacks: UInt64
     let renderCallbacks: UInt64
     let bandLevels: [Double]
+    let spectrumLevels: [Double]
 
     static let empty = AudioEngineTelemetry(
         capturedFrames: 0,
@@ -117,7 +132,8 @@ struct AudioEngineTelemetry: Equatable {
         bufferedFrames: 0,
         inputCallbacks: 0,
         renderCallbacks: 0,
-        bandLevels: Array(repeating: 0, count: EqualizerBand.standardFrequencies.count)
+        bandLevels: Array(repeating: 0, count: EqualizerBand.standardFrequencies.count),
+        spectrumLevels: []
     )
 
     var summary: String {
@@ -148,6 +164,7 @@ final class AudioEngineService {
         outputName: String,
         virtualCaptureUID: String?,
         virtualCaptureName: String?,
+        spectrumAnalyzerEnabled: Bool,
         processedTakeoverEnabled: Bool
     ) -> AudioEngineConfiguration {
         let fallbackFilters = filterDescriptors(from: bands)
@@ -160,13 +177,20 @@ final class AudioEngineService {
             fallbackOutputUID: outputUID,
             fallbackOutputName: outputName
         )
-        let selectedRoutePlans = routePlans.filter { route in
-            guard let outputUID else {
-                return true
-            }
-            return route.outputUID == nil || route.outputUID == outputUID
+        let routableRoutePlans = routePlans.filter { $0.outputUID != nil }
+        let renderTargets = makeRenderTargets(
+            from: routableRoutePlans,
+            nodeByID: nodeByID,
+            fallbackFilters: fallbackFilters,
+            fallbackPreamp: preamp,
+            fallbackBalance: balance
+        )
+        let primaryOutputUID = outputUID ?? renderTargets.first?.outputUID
+        let primaryRoutePlans = routableRoutePlans.filter { route in
+            guard let primaryOutputUID else { return false }
+            return route.outputUID == primaryOutputUID
         }
-        let effectiveEQNodeIDs = orderedUnique(selectedRoutePlans.flatMap(\.eqNodeIDs))
+        let effectiveEQNodeIDs = orderedUnique(primaryRoutePlans.flatMap(\.eqNodeIDs))
         let effectiveEQNodes = effectiveEQNodeIDs.compactMap { nodeByID[$0] }
         let routeFilters = effectiveEQNodes.flatMap { node in
             filterDescriptors(from: renderBands(for: node))
@@ -185,12 +209,13 @@ final class AudioEngineService {
                 let source = sources.first(where: { $0.id == node.audioSourceID })
                 let sourceID = node.audioSourceID ?? AudioSourceItem.systemMixID
                 return AudioEngineSourceRoute(
+                    sourceNodeID: node.id,
                     sourceID: sourceID,
                     title: source?.title ?? node.title,
                     bundleIdentifier: source?.bundleIdentifier,
                     processIdentifier: source?.processIdentifier,
-                    reachesOutput: selectedRoutePlans.contains { route in
-                        route.sourceID == sourceID
+                    reachesOutput: routableRoutePlans.contains { route in
+                        route.sourceNodeID == node.id
                     }
                 )
             }
@@ -201,11 +226,13 @@ final class AudioEngineService {
             preamp: effectivePreamp,
             balance: effectiveBalance,
             sourceRoutes: sourceRoutes,
-            routePlans: selectedRoutePlans,
-            outputUID: outputUID,
-            outputName: outputName,
+            routePlans: routableRoutePlans,
+            renderTargets: renderTargets,
+            outputUID: primaryOutputUID,
+            outputName: renderTargets.first(where: { $0.outputUID == primaryOutputUID })?.outputName ?? outputName,
             virtualCaptureUID: virtualCaptureUID,
             virtualCaptureName: virtualCaptureName,
+            spectrumAnalyzerEnabled: spectrumAnalyzerEnabled,
             nodeCount: nodes.count,
             connectionCount: connections.count,
             mutesOriginalAudio: processedTakeoverEnabled
@@ -240,11 +267,11 @@ final class AudioEngineService {
             )
         }
 
-        guard configuration.outputUID != nil else {
+        guard !configuration.renderTargets.isEmpty else {
             return AudioEngineStatus(
                 state: .blocked,
                 title: "No Output",
-                detail: "Choose a desired output device before starting the audio engine.",
+                detail: "Patch at least one route to a hardware output before starting the audio engine.",
                 processTapsAvailable: tapsAvailable,
                 driverInstalled: installed,
                 driverBundled: bundled
@@ -253,11 +280,11 @@ final class AudioEngineService {
 
         if configuration.virtualCaptureUID != nil, tapsAvailable {
             let routeCount = configuration.routePlans.count
-            let filterCount = configuration.filters.count
+            let filterCount = configuration.renderTargets.reduce(0) { $0 + $1.filters.count }
             return AudioEngineStatus(
                 state: .ready,
                 title: "Locked Tap Ready",
-                detail: "System output is held on \(configuration.virtualCaptureName ?? "PureQ Virtual Output"); PureQ taps routed sources and renders EQ to \(configuration.outputName): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s").",
+                detail: "System output is held on \(configuration.virtualCaptureName ?? "PureQ Virtual Output"); PureQ taps routed sources and renders EQ to \(renderTargetSummary(configuration.renderTargets)): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s").",
                 processTapsAvailable: tapsAvailable,
                 driverInstalled: installed,
                 driverBundled: bundled
@@ -266,11 +293,11 @@ final class AudioEngineService {
 
         if configuration.virtualCaptureUID != nil {
             let routeCount = configuration.routePlans.count
-            let filterCount = configuration.filters.count
+            let filterCount = configuration.renderTargets.reduce(0) { $0 + $1.filters.count }
             return AudioEngineStatus(
                 state: .ready,
                 title: "Virtual Loopback Ready",
-                detail: "\(configuration.virtualCaptureName ?? "PureQ Virtual Output") loopback -> EQ -> \(configuration.outputName): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s").",
+                detail: "\(configuration.virtualCaptureName ?? "PureQ Virtual Output") loopback -> EQ -> \(renderTargetSummary(configuration.renderTargets)): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s").",
                 processTapsAvailable: tapsAvailable,
                 driverInstalled: installed,
                 driverBundled: bundled
@@ -302,12 +329,12 @@ final class AudioEngineService {
             }
 
             let routeCount = configuration.routePlans.count
-            let filterCount = configuration.filters.count
+            let filterCount = configuration.renderTargets.reduce(0) { $0 + $1.filters.count }
             let renderMode = configuration.mutesOriginalAudio ? "Processed takeover" : "Monitor"
             return AudioEngineStatus(
                 state: .ready,
                 title: "Tap Engine Ready",
-                detail: "\(renderMode): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s"), rendering to \(configuration.outputName).",
+                detail: "\(renderMode): \(routeCount) route\(routeCount == 1 ? "" : "s"), \(filterCount) active filter\(filterCount == 1 ? "" : "s"), rendering to \(renderTargetSummary(configuration.renderTargets)).",
                 processTapsAvailable: tapsAvailable,
                 driverInstalled: installed,
                 driverBundled: bundled
@@ -348,12 +375,12 @@ final class AudioEngineService {
 
     func startRendering(
         configuration: AudioEngineConfiguration,
-        outputDeviceID: AudioDeviceID?,
+        outputDeviceIDsByUID: [String: AudioDeviceID],
         captureDeviceID: AudioDeviceID?
     ) throws {
         try runner.start(
             configuration: configuration,
-            outputDeviceID: outputDeviceID,
+            outputDeviceIDsByUID: outputDeviceIDsByUID,
             captureDeviceID: captureDeviceID
         )
     }
@@ -379,6 +406,14 @@ final class AudioEngineService {
 
     private var installedDriverExists: Bool {
         FileManager.default.fileExists(atPath: "/Library/Audio/Plug-Ins/HAL/PureQ.driver")
+    }
+
+    private func renderTargetSummary(_ targets: [AudioEngineRenderTarget]) -> String {
+        guard let first = targets.first else { return "no output" }
+        if targets.count == 1 {
+            return first.outputName
+        }
+        return "\(first.outputName) + \(targets.count - 1) more"
     }
 
     private func compileRoutePlans(
@@ -415,6 +450,7 @@ final class AudioEngineService {
                     }.clamped(to: -24...24)
 
                 return AudioEngineRoutePlan(
+                    sourceNodeID: sourceNode.id,
                     sourceID: sourceID,
                     title: source?.title ?? sourceNode.title,
                     bundleIdentifier: source?.bundleIdentifier,
@@ -427,6 +463,47 @@ final class AudioEngineService {
                     preamp: routePreamp
                 )
             }
+        }
+    }
+
+    private func makeRenderTargets(
+        from routePlans: [AudioEngineRoutePlan],
+        nodeByID: [RoutingNode.ID: RoutingNode],
+        fallbackFilters: [AudioEngineFilterDescriptor],
+        fallbackPreamp: Double,
+        fallbackBalance: Double
+    ) -> [AudioEngineRenderTarget] {
+        let groupedPlans = Dictionary(grouping: routePlans) { route in
+            route.outputUID ?? ""
+        }
+
+        return groupedPlans.compactMap { outputUID, plans -> AudioEngineRenderTarget? in
+            guard !outputUID.isEmpty else { return nil }
+
+            let effectiveEQNodeIDs = orderedUnique(plans.flatMap(\.eqNodeIDs))
+            let effectiveEQNodes = effectiveEQNodeIDs.compactMap { nodeByID[$0] }
+            let filters = effectiveEQNodes.flatMap { node in
+                filterDescriptors(from: renderBands(for: node))
+            }
+            let preamp = effectiveEQNodes.isEmpty
+                ? fallbackPreamp
+                : effectiveEQNodes.reduce(0) { partialResult, node in
+                    partialResult + node.eqPreamp
+                }.clamped(to: -24...24)
+            let balance = (effectiveEQNodes.last?.eqBalance ?? fallbackBalance).clamped(to: -1...1)
+            let outputName = plans.first(where: { $0.outputUID == outputUID })?.outputName ?? "Output"
+
+            return AudioEngineRenderTarget(
+                outputUID: outputUID,
+                outputName: outputName,
+                routeCount: plans.count,
+                filters: Array((effectiveEQNodes.isEmpty ? fallbackFilters : filters).prefix(96)),
+                preamp: preamp,
+                balance: balance
+            )
+        }
+        .sorted { lhs, rhs in
+            lhs.outputName.localizedCaseInsensitiveCompare(rhs.outputName) == .orderedAscending
         }
     }
 
@@ -535,15 +612,8 @@ private enum PureQAudioEngineError: LocalizedError {
 }
 
 private final class PureQAudioEngineRunner {
-    private let ringBuffer = StereoRingBuffer(
-        capacityFrames: 48_000,
-        startThresholdFrames: 2_048,
-        targetFrames: 4_096
-    )
-
-    private var avEngine: AVAudioEngine?
-    private var sourceNode: AVAudioSourceNode?
-    private var eqUnit: AVAudioUnitEQ?
+    private var outputRenderers: [String: PureQOutputRenderer] = [:]
+    private let outputRendererLock = NSLock()
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
@@ -551,18 +621,22 @@ private final class PureQAudioEngineRunner {
     private var loopbackIOProcID: AudioDeviceIOProcID?
     private var selfReference: Unmanaged<PureQAudioEngineRunner>?
     private let telemetryLock = NSLock()
+    private let parameterLock = NSLock()
+    private var currentSpectrumAnalyzerEnabled = false
     private var capturedFrames: UInt64 = 0
     private var renderedFrames: UInt64 = 0
     private var underrunFrames: UInt64 = 0
     private var inputCallbacks: UInt64 = 0
     private var renderCallbacks: UInt64 = 0
     private let bandAnalyzer = PureQBandLevelAnalyzer(frequencies: EqualizerBand.standardFrequencies)
+    private let spectrumAnalyzer = PureQSpectrumAnalyzer()
 
     private(set) var runState: AudioEngineRunState = .stopped
 
     var telemetry: AudioEngineTelemetry {
-        let bufferedFrames = UInt64(ringBuffer.availableFrameCount)
+        let bufferedFrames = UInt64(outputRendererSnapshot().map(\.availableFrameCount).max() ?? 0)
         let bandLevels = bandAnalyzer.levelSnapshot()
+        let spectrumLevels = spectrumAnalyzerEnabledSnapshot() ? spectrumAnalyzer.levelSnapshot() : []
         telemetryLock.lock()
             let snapshot = AudioEngineTelemetry(
                 capturedFrames: capturedFrames,
@@ -571,7 +645,8 @@ private final class PureQAudioEngineRunner {
                 bufferedFrames: bufferedFrames,
                 inputCallbacks: inputCallbacks,
                 renderCallbacks: renderCallbacks,
-                bandLevels: bandLevels
+                bandLevels: bandLevels,
+                spectrumLevels: spectrumLevels
             )
         telemetryLock.unlock()
         return snapshot
@@ -579,11 +654,11 @@ private final class PureQAudioEngineRunner {
 
     func start(
         configuration: AudioEngineConfiguration,
-        outputDeviceID: AudioDeviceID?,
+        outputDeviceIDsByUID: [String: AudioDeviceID],
         captureDeviceID: AudioDeviceID?
     ) throws {
         let wasActive = runState != .stopped ||
-            avEngine != nil ||
+            !outputRenderers.isEmpty ||
             tapID != kAudioObjectUnknown ||
             aggregateDeviceID != kAudioObjectUnknown
         stop()
@@ -594,7 +669,13 @@ private final class PureQAudioEngineRunner {
         guard captureDeviceID != nil || processTapsAreAvailable else {
             throw PureQAudioEngineError.processTapsUnavailable
         }
-        guard let outputDeviceID else {
+        guard !configuration.renderTargets.isEmpty else {
+            throw PureQAudioEngineError.noOutputDevice
+        }
+        let outputDeviceIDs = Dictionary(uniqueKeysWithValues: configuration.renderTargets.compactMap { target in
+            outputDeviceIDsByUID[target.outputUID].map { (target.outputUID, $0) }
+        })
+        guard outputDeviceIDs.count == configuration.renderTargets.count else {
             throw PureQAudioEngineError.noOutputDevice
         }
 
@@ -603,8 +684,8 @@ private final class PureQAudioEngineRunner {
             throw PureQAudioEngineError.noRoutedSources
         }
 
-        ringBuffer.reset()
         resetTelemetry()
+        setSpectrumAnalyzerEnabled(configuration.spectrumAnalyzerEnabled)
 
         do {
             let renderSampleRate: Double
@@ -617,11 +698,23 @@ private final class PureQAudioEngineRunner {
                 throw PureQAudioEngineError.processTapsUnavailable
             }
             bandAnalyzer.configure(sampleRate: renderSampleRate)
-            try startOutputEngine(
-                configuration: configuration,
-                outputDeviceID: outputDeviceID,
-                sampleRate: renderSampleRate
-            )
+            spectrumAnalyzer.configure(sampleRate: renderSampleRate)
+            for target in configuration.renderTargets {
+                guard let outputDeviceID = outputDeviceIDs[target.outputUID] else {
+                    throw PureQAudioEngineError.noOutputDevice
+                }
+                let renderer = PureQOutputRenderer(target: target)
+                try renderer.start(
+                    target: target,
+                    enabled: configuration.enabled,
+                    outputDeviceID: outputDeviceID,
+                    sampleRate: renderSampleRate,
+                    recordRender: { [weak self] requestedFrames, renderedFrames in
+                        self?.recordRender(requestedFrames: requestedFrames, renderedFrames: renderedFrames)
+                    }
+                )
+                setOutputRenderer(renderer, for: target.outputUID)
+            }
             runState = .running
         } catch {
             stop()
@@ -631,12 +724,6 @@ private final class PureQAudioEngineRunner {
     }
 
     func stop() {
-        avEngine?.stop()
-        avEngine?.reset()
-        avEngine = nil
-        sourceNode = nil
-        eqUnit = nil
-
         if let loopbackIOProcID, loopbackDeviceID != kAudioObjectUnknown {
             _ = AudioDeviceStop(loopbackDeviceID, loopbackIOProcID)
             _ = AudioDeviceDestroyIOProcID(loopbackDeviceID, loopbackIOProcID)
@@ -662,9 +749,10 @@ private final class PureQAudioEngineRunner {
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
 
+        clearOutputRenderers().forEach { $0.stop() }
         selfReference = nil
-        ringBuffer.reset()
         resetTelemetry()
+        setSpectrumAnalyzerEnabled(false)
 
         if runState != .stopped {
             runState = .stopped
@@ -675,78 +763,71 @@ private final class PureQAudioEngineRunner {
         guard let inputData, frameCount > 0 else {
             return
         }
-        ringBuffer.write(from: inputData, frameCount: frameCount)
+        for renderer in outputRendererSnapshot() {
+            renderer.ingest(inputData: inputData, frameCount: frameCount)
+        }
         bandAnalyzer.process(inputData: inputData, frameCount: frameCount)
+        if spectrumAnalyzerEnabledSnapshot() {
+            spectrumAnalyzer.process(inputData: inputData, frameCount: frameCount)
+        }
         recordCapture(frameCount: frameCount)
     }
 
     func update(configuration: AudioEngineConfiguration) {
-        guard runState == .running, let eqUnit else {
+        guard runState == .running else {
             return
         }
-        if let avEngine {
-            applyBalance(configuration.balance, to: avEngine)
+        setSpectrumAnalyzerEnabled(configuration.spectrumAnalyzerEnabled)
+        for target in configuration.renderTargets {
+            outputRenderer(for: target.outputUID)?.update(target: target, enabled: configuration.enabled)
         }
-        configure(eq: eqUnit, with: configuration)
     }
 
-    private func startOutputEngine(
-        configuration: AudioEngineConfiguration,
-        outputDeviceID: AudioDeviceID,
-        sampleRate: Double
-    ) throws {
-        let engine = AVAudioEngine()
-        guard let renderFormat = AVAudioFormat(
-            standardFormatWithSampleRate: sampleRate.clamped(to: 8_000...384_000),
-            channels: 2
-        ) else {
-            throw PureQAudioEngineError.renderFormatCreationFailed
+    private func outputRendererSnapshot() -> [PureQOutputRenderer] {
+        guard outputRendererLock.try() else {
+            return []
         }
-        let source = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
-            guard let self else { return noErr }
-            let renderedFrameCount = self.ringBuffer.read(into: audioBufferList, frameCount: frameCount)
-            self.recordRender(requestedFrames: frameCount, renderedFrames: renderedFrameCount)
-            return noErr
-        }
-        let eq = AVAudioUnitEQ(numberOfBands: max(configuration.filters.count, 96))
-        configure(eq: eq, with: configuration)
-
-        engine.attach(source)
-        engine.attach(eq)
-        engine.connect(source, to: eq, format: renderFormat)
-        engine.connect(eq, to: engine.mainMixerNode, format: renderFormat)
-        applyBalance(configuration.balance, to: engine)
-
-        var deviceID = outputDeviceID
-        guard let outputAudioUnit = engine.outputNode.audioUnit else {
-            throw PureQAudioEngineError.outputAudioUnitUnavailable
-        }
-        let status = AudioUnitSetProperty(
-            outputAudioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard status == noErr else {
-            throw PureQAudioEngineError.outputDeviceSelectionFailed(status)
-        }
-
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            throw PureQAudioEngineError.avEngineStartFailed(error)
-        }
-
-        avEngine = engine
-        sourceNode = source
-        eqUnit = eq
+        let renderers = Array(outputRenderers.values)
+        outputRendererLock.unlock()
+        return renderers
     }
 
-    private func applyBalance(_ balance: Double, to engine: AVAudioEngine) {
-        engine.mainMixerNode.pan = Float(balance.clamped(to: -1...1))
+    private func outputRenderer(for outputUID: String) -> PureQOutputRenderer? {
+        outputRendererLock.lock()
+        let renderer = outputRenderers[outputUID]
+        outputRendererLock.unlock()
+        return renderer
+    }
+
+    private func setOutputRenderer(_ renderer: PureQOutputRenderer, for outputUID: String) {
+        outputRendererLock.lock()
+        outputRenderers[outputUID] = renderer
+        outputRendererLock.unlock()
+    }
+
+    private func clearOutputRenderers() -> [PureQOutputRenderer] {
+        outputRendererLock.lock()
+        let renderers = Array(outputRenderers.values)
+        outputRenderers.removeAll(keepingCapacity: true)
+        outputRendererLock.unlock()
+        return renderers
+    }
+
+    private func setSpectrumAnalyzerEnabled(_ isEnabled: Bool) {
+        parameterLock.lock()
+        currentSpectrumAnalyzerEnabled = isEnabled
+        parameterLock.unlock()
+
+        if !isEnabled {
+            spectrumAnalyzer.reset()
+        }
+    }
+
+    private func spectrumAnalyzerEnabledSnapshot() -> Bool {
+        parameterLock.lock()
+        let isEnabled = currentSpectrumAnalyzerEnabled
+        parameterLock.unlock()
+        return isEnabled
     }
 
     private func startLoopbackCapture(deviceID: AudioDeviceID) throws {
@@ -771,40 +852,6 @@ private final class PureQAudioEngineRunner {
 
         loopbackDeviceID = deviceID
         loopbackIOProcID = createdIOProcID
-    }
-
-    private func configure(eq: AVAudioUnitEQ, with configuration: AudioEngineConfiguration) {
-        let filters = configuration.filters
-        eq.bypass = !configuration.enabled
-        eq.globalGain = Float(configuration.preamp.clamped(to: -24...24))
-
-        for (index, band) in eq.bands.enumerated() {
-            guard index < filters.count else {
-                band.bypass = true
-                continue
-            }
-
-            let descriptor = filters[index]
-            band.bypass = false
-            band.frequency = Float(descriptor.frequency.clamped(to: 20...20_000))
-            band.gain = Float(descriptor.gain.clamped(to: -24...24))
-            band.bandwidth = Float(octaveBandwidth(forQ: descriptor.q))
-
-            switch descriptor.shape {
-            case .bell:
-                band.filterType = .parametric
-            case .shelf:
-                band.filterType = descriptor.frequency < 1_000 ? .lowShelf : .highShelf
-            case .notch:
-                band.filterType = .bandStop
-            }
-        }
-    }
-
-    private func octaveBandwidth(forQ q: Double) -> Double {
-        let clampedQ = q.clamped(to: 0.1...10)
-        let halfWidth = asinh(1 / (2 * clampedQ)) / log(2)
-        return (2 * halfWidth).clamped(to: 0.05...5.0)
     }
 
     @available(macOS 14.2, *)
@@ -880,10 +927,8 @@ private final class PureQAudioEngineRunner {
             description.isMixdown = true
             description.isMono = false
         } else {
-            let processObjectIDs = try routedSources.compactMap { route -> AudioObjectID? in
-                guard let pid = route.processIdentifier else {
-                    return nil
-                }
+            let processIDs = Array(Set(routedSources.compactMap(\.processIdentifier))).sorted()
+            let processObjectIDs = try processIDs.map { pid -> AudioObjectID in
                 guard let objectID = processObjectID(for: pid) else {
                     throw PureQAudioEngineError.processObjectLookupFailed(pid)
                 }
@@ -904,6 +949,7 @@ private final class PureQAudioEngineRunner {
 
     private func resetTelemetry() {
         bandAnalyzer.reset()
+        spectrumAnalyzer.reset()
         telemetryLock.lock()
         capturedFrames = 0
         renderedFrames = 0
@@ -978,6 +1024,165 @@ private final class PureQAudioEngineRunner {
             return true
         }
         return false
+    }
+}
+
+private final class PureQOutputRenderer {
+    private let ringBuffer = StereoRingBuffer(
+        capacityFrames: 48_000,
+        startThresholdFrames: 2_048,
+        targetFrames: 4_096
+    )
+
+    private var avEngine: AVAudioEngine?
+    private var sourceNode: AVAudioSourceNode?
+    private var eqUnit: AVAudioUnitEQ?
+    private let parameterLock = NSLock()
+    private var currentBalance: Double
+
+    init(target: AudioEngineRenderTarget) {
+        currentBalance = target.balance.clamped(to: -1...1)
+    }
+
+    var availableFrameCount: Int {
+        ringBuffer.availableFrameCount
+    }
+
+    func start(
+        target: AudioEngineRenderTarget,
+        enabled: Bool,
+        outputDeviceID: AudioDeviceID,
+        sampleRate: Double,
+        recordRender: @escaping (AVAudioFrameCount, UInt32) -> Void
+    ) throws {
+        let engine = AVAudioEngine()
+        guard let renderFormat = AVAudioFormat(
+            standardFormatWithSampleRate: sampleRate.clamped(to: 8_000...384_000),
+            channels: 2
+        ) else {
+            throw PureQAudioEngineError.renderFormatCreationFailed
+        }
+
+        let source = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
+            guard let self else { return noErr }
+            let renderedFrameCount = self.ringBuffer.read(
+                into: audioBufferList,
+                frameCount: frameCount,
+                balance: self.currentBalanceSnapshot()
+            )
+            recordRender(frameCount, renderedFrameCount)
+            return noErr
+        }
+        let eq = AVAudioUnitEQ(numberOfBands: max(target.filters.count, 96))
+        configure(eq: eq, filters: target.filters, preamp: target.preamp, enabled: enabled)
+
+        engine.attach(source)
+        engine.attach(eq)
+        engine.connect(source, to: eq, format: renderFormat)
+        engine.connect(eq, to: engine.mainMixerNode, format: renderFormat)
+        engine.mainMixerNode.pan = 0
+
+        var deviceID = outputDeviceID
+        guard let outputAudioUnit = engine.outputNode.audioUnit else {
+            throw PureQAudioEngineError.outputAudioUnitUnavailable
+        }
+        let status = AudioUnitSetProperty(
+            outputAudioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else {
+            throw PureQAudioEngineError.outputDeviceSelectionFailed(status)
+        }
+
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            throw PureQAudioEngineError.avEngineStartFailed(error)
+        }
+
+        avEngine = engine
+        sourceNode = source
+        eqUnit = eq
+    }
+
+    func stop() {
+        avEngine?.stop()
+        avEngine?.reset()
+        avEngine = nil
+        sourceNode = nil
+        eqUnit = nil
+        ringBuffer.reset()
+    }
+
+    func ingest(inputData: UnsafePointer<AudioBufferList>, frameCount: UInt32) {
+        ringBuffer.write(from: inputData, frameCount: frameCount)
+    }
+
+    func update(target: AudioEngineRenderTarget, enabled: Bool) {
+        setCurrentBalance(target.balance)
+        guard let eqUnit else { return }
+        configure(
+            eq: eqUnit,
+            filters: target.filters,
+            preamp: target.preamp,
+            enabled: enabled
+        )
+    }
+
+    private func setCurrentBalance(_ balance: Double) {
+        parameterLock.lock()
+        currentBalance = balance.clamped(to: -1...1)
+        parameterLock.unlock()
+    }
+
+    private func currentBalanceSnapshot() -> Double {
+        parameterLock.lock()
+        let balance = currentBalance
+        parameterLock.unlock()
+        return balance
+    }
+
+    private func configure(
+        eq: AVAudioUnitEQ,
+        filters: [AudioEngineFilterDescriptor],
+        preamp: Double,
+        enabled: Bool
+    ) {
+        eq.bypass = !enabled
+        eq.globalGain = Float(preamp.clamped(to: -24...24))
+
+        for (index, band) in eq.bands.enumerated() {
+            guard index < filters.count else {
+                band.bypass = true
+                continue
+            }
+
+            let descriptor = filters[index]
+            band.bypass = false
+            band.frequency = Float(descriptor.frequency.clamped(to: 20...20_000))
+            band.gain = Float(descriptor.gain.clamped(to: -24...24))
+            band.bandwidth = Float(octaveBandwidth(forQ: descriptor.q))
+
+            switch descriptor.shape {
+            case .bell:
+                band.filterType = .parametric
+            case .shelf:
+                band.filterType = descriptor.frequency < 1_000 ? .lowShelf : .highShelf
+            case .notch:
+                band.filterType = .bandStop
+            }
+        }
+    }
+
+    private func octaveBandwidth(forQ q: Double) -> Double {
+        let clampedQ = q.clamped(to: 0.1...10)
+        let halfWidth = asinh(1 / (2 * clampedQ)) / log(2)
+        return (2 * halfWidth).clamped(to: 0.05...5.0)
     }
 }
 
@@ -1134,6 +1339,210 @@ private final class PureQBandLevelAnalyzer {
     }
 }
 
+private final class PureQSpectrumAnalyzer {
+    private let fftSize = 2_048
+    private let displayBinCount = 96
+    private let minimumFrequency = 20.0
+    private let maximumDisplayFrequency = 20_000.0
+    private let lock = NSLock()
+
+    private var sampleRate = 48_000.0
+    private var fftSetup: FFTSetup?
+    private var log2FFTSize: vDSP_Length = 11
+    private var window: [Float]
+    private var sampleBuffer: [Float]
+    private var windowedSamples: [Float]
+    private var realParts: [Float]
+    private var imaginaryParts: [Float]
+    private var magnitudes: [Float]
+    private var levels: [Double]
+    private var binRanges: [Range<Int>]
+    private var writeCursor = 0
+
+    init() {
+        window = Array(repeating: 0, count: fftSize)
+        sampleBuffer = Array(repeating: 0, count: fftSize)
+        windowedSamples = Array(repeating: 0, count: fftSize)
+        realParts = Array(repeating: 0, count: fftSize / 2)
+        imaginaryParts = Array(repeating: 0, count: fftSize / 2)
+        magnitudes = Array(repeating: 0, count: fftSize / 2)
+        levels = Array(repeating: 0, count: displayBinCount)
+        binRanges = []
+        vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+        rebuildFFTSetup()
+        configure(sampleRate: sampleRate)
+    }
+
+    deinit {
+        if let fftSetup {
+            vDSP_destroy_fftsetup(fftSetup)
+        }
+    }
+
+    func configure(sampleRate: Double) {
+        lock.lock()
+        self.sampleRate = sampleRate.clamped(to: 8_000...384_000)
+        rebuildBinRanges()
+        resetUnlocked()
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        resetUnlocked()
+        lock.unlock()
+    }
+
+    func process(inputData: UnsafePointer<AudioBufferList>, frameCount: UInt32) {
+        guard lock.try() else {
+            return
+        }
+        defer { lock.unlock() }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+        guard !buffers.isEmpty, frameCount > 0 else {
+            decayLevelsUnlocked()
+            return
+        }
+
+        let frames = Int(frameCount)
+        for frame in 0..<frames {
+            sampleBuffer[writeCursor] = monoSample(in: buffers, frame: frame)
+            writeCursor += 1
+
+            if writeCursor >= fftSize {
+                performFFTUnlocked()
+                writeCursor = 0
+            }
+        }
+    }
+
+    func levelSnapshot() -> [Double] {
+        lock.lock()
+        let snapshot = levels
+        lock.unlock()
+        return snapshot
+    }
+
+    private func rebuildFFTSetup() {
+        let exponent = Int(round(log2(Double(fftSize))))
+        log2FFTSize = vDSP_Length(exponent)
+        if let fftSetup {
+            vDSP_destroy_fftsetup(fftSetup)
+        }
+        fftSetup = vDSP_create_fftsetup(log2FFTSize, FFTRadix(kFFTRadix2))
+    }
+
+    private func rebuildBinRanges() {
+        let nyquist = max(sampleRate * 0.5, minimumFrequency + 1)
+        let upperFrequency = min(maximumDisplayFrequency, nyquist * 0.94)
+        let minLog = log10(minimumFrequency)
+        let maxLog = log10(max(upperFrequency, minimumFrequency + 1))
+        let binWidth = sampleRate / Double(fftSize)
+        let maxFFTBin = max(1, fftSize / 2)
+
+        binRanges = (0..<displayBinCount).map { index in
+            let lowerFraction = Double(index) / Double(displayBinCount)
+            let upperFraction = Double(index + 1) / Double(displayBinCount)
+            let lowerFrequency = pow(10, minLog + ((maxLog - minLog) * lowerFraction))
+            let upperFrequency = pow(10, minLog + ((maxLog - minLog) * upperFraction))
+            let lowerIndex = max(1, min(maxFFTBin - 1, Int(floor(lowerFrequency / binWidth))))
+            let upperIndex = max(lowerIndex + 1, min(maxFFTBin, Int(ceil(upperFrequency / binWidth))))
+            return lowerIndex..<upperIndex
+        }
+    }
+
+    private func resetUnlocked() {
+        sampleBuffer.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+        }
+        windowedSamples.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+        }
+        realParts.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+        }
+        imaginaryParts.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+        }
+        magnitudes.withUnsafeMutableBufferPointer { buffer in
+            buffer.initialize(repeating: 0)
+        }
+        levels = Array(repeating: 0, count: displayBinCount)
+        writeCursor = 0
+    }
+
+    private func performFFTUnlocked() {
+        guard let fftSetup else { return }
+
+        vDSP.multiply(sampleBuffer, window, result: &windowedSamples)
+        realParts.withUnsafeMutableBufferPointer { realPointer in
+            imaginaryParts.withUnsafeMutableBufferPointer { imaginaryPointer in
+                guard let realBase = realPointer.baseAddress,
+                      let imaginaryBase = imaginaryPointer.baseAddress else {
+                    return
+                }
+
+                var splitComplex = DSPSplitComplex(realp: realBase, imagp: imaginaryBase)
+                windowedSamples.withUnsafeBufferPointer { samplesPointer in
+                    guard let sampleBase = samplesPointer.baseAddress else { return }
+                    sampleBase.withMemoryRebound(to: DSPComplex.self, capacity: fftSize / 2) { complexPointer in
+                        vDSP_ctoz(complexPointer, 2, &splitComplex, 1, vDSP_Length(fftSize / 2))
+                    }
+                }
+
+                vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2FFTSize, FFTDirection(FFT_FORWARD))
+                vDSP_zvabs(&splitComplex, 1, &magnitudes, 1, vDSP_Length(fftSize / 2))
+            }
+        }
+
+        let magnitudeScale = Double(2.0 / Float(fftSize))
+        for (levelIndex, range) in binRanges.enumerated() where levels.indices.contains(levelIndex) {
+            var peak = 0.0
+            for fftBin in range where magnitudes.indices.contains(fftBin) {
+                peak = max(peak, Double(magnitudes[fftBin]) * magnitudeScale)
+            }
+
+            let decibels = 20 * log10(max(peak, 0.000_000_1))
+            let normalized = ((decibels + 72) / 72).clamped(to: 0...1)
+            let current = levels[levelIndex]
+            let response = normalized > current ? 0.38 : 0.12
+            levels[levelIndex] = current + ((normalized - current) * response)
+        }
+    }
+
+    private func decayLevelsUnlocked() {
+        for index in levels.indices {
+            levels[index] *= 0.86
+        }
+    }
+
+    private func monoSample(in buffers: UnsafeMutableAudioBufferListPointer, frame: Int) -> Float {
+        if buffers.count == 1 {
+            let buffer = buffers[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                return 0
+            }
+            let channelCount = Int(max(buffer.mNumberChannels, 1))
+            if channelCount == 1 {
+                return data[frame]
+            }
+            let base = frame * channelCount
+            return (data[base] + data[base + 1]) * 0.5
+        }
+
+        guard let leftData = buffers[0].mData?.assumingMemoryBound(to: Float.self) else {
+            return 0
+        }
+        let left = leftData[frame]
+        guard buffers.count > 1,
+              let rightData = buffers[1].mData?.assumingMemoryBound(to: Float.self) else {
+            return left
+        }
+        return (left + rightData[frame]) * 0.5
+    }
+}
+
 private final class StereoRingBuffer {
     private let lock = NSLock()
     private var storage: [Float]
@@ -1214,7 +1623,11 @@ private final class StereoRingBuffer {
         trimExcessBufferIfNeeded()
     }
 
-    func read(into outputData: UnsafeMutablePointer<AudioBufferList>, frameCount: AVAudioFrameCount) -> UInt32 {
+    func read(
+        into outputData: UnsafeMutablePointer<AudioBufferList>,
+        frameCount: AVAudioFrameCount,
+        balance: Double = 0
+    ) -> UInt32 {
         let buffers = UnsafeMutableAudioBufferListPointer(outputData)
         guard !buffers.isEmpty else {
             return 0
@@ -1255,16 +1668,17 @@ private final class StereoRingBuffer {
 
             let currentIndex = readIndex
             let nextIndex = (readIndex + 1) % capacityFrames
-            let left = interpolatedSample(
+            var left = interpolatedSample(
                 current: storage[currentIndex * 2],
                 next: storage[nextIndex * 2],
                 fraction: fractionalReadFrame
             )
-            let right = interpolatedSample(
+            var right = interpolatedSample(
                 current: storage[currentIndex * 2 + 1],
                 next: storage[nextIndex * 2 + 1],
                 fraction: fractionalReadFrame
             )
+            applyBalance(balance, left: &left, right: &right)
 
             for bufferIndex in 0..<buffers.count {
                 guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
@@ -1340,6 +1754,15 @@ private final class StereoRingBuffer {
     private func interpolatedSample(current: Float, next: Float, fraction: Double) -> Float {
         let amount = Float(fraction.clamped(to: 0...1))
         return current + ((next - current) * amount)
+    }
+
+    private func applyBalance(_ balance: Double, left: inout Float, right: inout Float) {
+        let clampedBalance = balance.clamped(to: -1...1)
+        if clampedBalance > 0 {
+            left *= Float(1 - clampedBalance)
+        } else if clampedBalance < 0 {
+            right *= Float(1 + clampedBalance)
+        }
     }
 
     private func fillSilence(buffers: UnsafeMutableAudioBufferListPointer, frameCount: AVAudioFrameCount) {

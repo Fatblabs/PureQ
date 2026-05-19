@@ -10,6 +10,7 @@ PACKAGE_WORK_DIR="$ROOT_DIR/DerivedData/PackageWork"
 PACKAGE_ROOT="$PACKAGE_WORK_DIR/root"
 PACKAGE_SCRIPTS="$PACKAGE_WORK_DIR/scripts"
 COMPONENT_PLIST="$PACKAGE_WORK_DIR/components.plist"
+PKG_SIGNING_IDENTITY="${PKG_SIGNING_IDENTITY:-}"
 
 APP_VERSION="$(
   xcodebuild -project "$PROJECT" -target PureQ -configuration "$CONFIGURATION" -showBuildSettings 2>/dev/null \
@@ -53,6 +54,7 @@ mkdir -p \
 COPYFILE_DISABLE=1 ditto --norsrc --noextattr "$APP_SRC" "$PACKAGE_ROOT/Applications/PureQ.app"
 COPYFILE_DISABLE=1 ditto --norsrc --noextattr "$DRIVER_SRC" "$PACKAGE_ROOT/Library/Audio/Plug-Ins/HAL/PureQ.driver"
 /usr/bin/xattr -cr "$PACKAGE_ROOT" 2>/dev/null || true
+/usr/bin/find "$PACKAGE_ROOT" -name '._*' -delete
 
 cat > "$PACKAGE_SCRIPTS/postinstall" <<'POSTINSTALL'
 #!/bin/zsh
@@ -81,18 +83,34 @@ set_nonrelocatable() {
     || true
 }
 
-set_nonrelocatable ":0:BundleIsRelocatable"
-set_nonrelocatable ":1:BundleIsRelocatable"
-set_nonrelocatable ":1:ChildBundles:0:BundleIsRelocatable"
+component_index=0
+while /usr/libexec/PlistBuddy -c "Print :$component_index" "$COMPONENT_PLIST" >/dev/null 2>&1; do
+  set_nonrelocatable ":$component_index:BundleIsRelocatable"
+
+  child_index=0
+  while /usr/libexec/PlistBuddy -c "Print :$component_index:ChildBundles:$child_index" "$COMPONENT_PLIST" >/dev/null 2>&1; do
+    set_nonrelocatable ":$component_index:ChildBundles:$child_index:BundleIsRelocatable"
+    child_index=$((child_index + 1))
+  done
+
+  component_index=$((component_index + 1))
+done
 
 echo "Packaging $PKG_PATH..."
-COPYFILE_DISABLE=1 pkgbuild \
-  --root "$PACKAGE_ROOT" \
-  --scripts "$PACKAGE_SCRIPTS" \
-  --component-plist "$COMPONENT_PLIST" \
-  --identifier "Sean-s-Apps.PureQ.pkg" \
-  --version "$APP_VERSION" \
-  --install-location "/" \
-  "$PKG_PATH"
+PKGBUILD_ARGS=(
+  --root "$PACKAGE_ROOT"
+  --scripts "$PACKAGE_SCRIPTS"
+  --component-plist "$COMPONENT_PLIST"
+  --identifier "Sean-s-Apps.PureQ.pkg"
+  --version "$APP_VERSION"
+  --install-location "/"
+  --ownership recommended
+)
+
+if [[ -n "$PKG_SIGNING_IDENTITY" ]]; then
+  PKGBUILD_ARGS+=(--sign "$PKG_SIGNING_IDENTITY" --timestamp)
+fi
+
+COPYFILE_DISABLE=1 pkgbuild "${PKGBUILD_ARGS[@]}" "$PKG_PATH"
 
 echo "Created installer: $PKG_PATH"

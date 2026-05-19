@@ -4,7 +4,6 @@
 //
 
 import AppKit
-import AppIntents
 import SwiftUI
 
 @MainActor
