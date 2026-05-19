@@ -908,43 +908,51 @@ private final class PureQAudioEngineRunner {
     private func makeTapDescription(for routedSources: [AudioEngineSourceRoute], mutesOriginalAudio: Bool) throws -> CATapDescription {
         let includesSystemMix = routedSources.contains { $0.sourceID == AudioSourceItem.systemMixID }
 
-        let description: CATapDescription
         if includesSystemMix {
             let selfPID = ProcessInfo.processInfo.processIdentifier
             guard let selfProcessObjectID = processObjectID(for: selfPID) else {
                 throw PureQAudioEngineError.processObjectLookupFailed(selfPID)
             }
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: [selfProcessObjectID])
-        } else if #available(macOS 26.0, *) {
+            return CATapDescription(stereoGlobalTapButExcludeProcesses: [selfProcessObjectID])
+        }
+
+        // 1. Attempt Bundle ID-based Target (macOS 26+ SDK compilation check)
+        #if compiler(>=6.2) // Match the exact compiler version that ships with the future SDK
+        if #available(macOS 26.0, *) {
             let bundleIDs = Array(Set(routedSources.compactMap(\.bundleIdentifier))).sorted()
             guard !bundleIDs.isEmpty else {
                 throw PureQAudioEngineError.noRunningProcessSource
             }
-            description = CATapDescription()
+            
+            let description = CATapDescription()
             description.bundleIDs = bundleIDs
             description.isProcessRestoreEnabled = true
             description.isExclusive = false
             description.isMixdown = true
             description.isMono = false
-        } else {
-            let processIDs = Array(Set(routedSources.compactMap(\.processIdentifier))).sorted()
-            let processObjectIDs = try processIDs.map { pid -> AudioObjectID in
-                guard let objectID = processObjectID(for: pid) else {
-                    throw PureQAudioEngineError.processObjectLookupFailed(pid)
-                }
-                return objectID
-            }
-            guard !processObjectIDs.isEmpty else {
-                throw PureQAudioEngineError.noRunningProcessSource
-            }
-            description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
+            
+            description.name = "PureQ Source Tap"
+            description.uuid = UUID()
+            description.isPrivate = true
+            description.muteBehavior = mutesOriginalAudio ? .mutedWhenTapped : .unmuted
+            return description
         }
+#endif // compiler(>=6.2)
 
-        description.name = "PureQ Source Tap"
-        description.uuid = UUID()
-        description.isPrivate = true
-        description.muteBehavior = mutesOriginalAudio ? CATapMuteBehavior.mutedWhenTapped : CATapMuteBehavior.unmuted
-        return description
+        // 2. Fallback Target (macOS 14.2 - 15.x logic)
+        let processIDs = Array(Set(routedSources.compactMap(\.processIdentifier))).sorted()
+        let processObjectIDs = try processIDs.map { pid -> AudioObjectID in
+            guard let objectID = processObjectID(for: pid) else {
+                throw PureQAudioEngineError.processObjectLookupFailed(pid)
+            }
+            return objectID
+        }
+        
+        guard !processObjectIDs.isEmpty else {
+            throw PureQAudioEngineError.noRunningProcessSource
+        }
+        
+        return CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
     }
 
     private func resetTelemetry() {
