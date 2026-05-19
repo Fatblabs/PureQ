@@ -1,0 +1,47 @@
+name: PureQ Auto Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers automatically when you push a version tag (e.g., v1.0.0, v2.1.0)
+
+permissions:
+  contents: write # Grants the workflow permission to create a Release and upload files
+
+jobs:
+  build-and-release:
+    name: Build macOS App & Publish
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Build Xcode Archive
+        run: |
+          xcodebuild archive \
+            -scheme "PureQ" \
+            -archivePath ./build/PureQ.xcarchive \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package App into DMG
+        run: |
+          # Create a staging folder for the disk image
+          mkdir -p ./dmg_root
+          
+          # Copy the compiled .app bundle into the staging folder
+          cp -R ./build/PureQ.xcarchive/Products/Applications/PureQ.app ./dmg_root/
+          
+          # Compress the folder into a standard Mac .dmg file
+          hdiutil create -volname "PureQ" -srcfolder ./dmg_root -ov -format UDZO PureQ.dmg
+
+      - name: Create GitHub Release and Upload DMG
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PureQ.dmg
+          generate_release_notes: true # Automatically populates release notes with your commit history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Built-in token provided automatically by GitHub
