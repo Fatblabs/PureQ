@@ -7,6 +7,7 @@
 PureQ is a native macOS system-wide parametric equalizer and node-based audio router. It provides per-application taps, flexible routing, and real-time EQ processing using a combination of Swift (SwiftUI) and a small CoreAudio driver.
 
 Key goals:
+
 - Low-latency, system-wide audio processing
 - Per-app routing and EQ profiles
 - Easy-to-use node-based routing canvas
@@ -14,6 +15,7 @@ Key goals:
 ---
 
 ## Highlights
+
 - Node-based audio routing (system mix and per-app taps)
 - Precision parametric EQ with customizable bands and filter types
 - Optional virtual audio device driver for loopback routing (`PureQDriver.c`)
@@ -36,6 +38,7 @@ Pre-built releases are the recommended way to use PureQ. Visit the Releases page
 ## Build & Run (developers)
 
 Requirements:
+
 - macOS 14+ (development) — app will attempt to gracefully fall back on older OSes where possible
 - Xcode 15+
 - Swift 5.9
@@ -57,6 +60,7 @@ sudo killall coreaudiod
 ```
 
 Notes for developers:
+
 - The Xcode workspace contains two primary targets: the SwiftUI app and a small C-based driver (`PureQDriver`).
 - Building and embedding the driver requires proper code signing for distribution. For local testing the script places the driver under `/Library/Audio/Plug-Ins/HAL/`.
 
@@ -70,6 +74,7 @@ Notes for developers:
 - `build/` — Xcode build artifacts (ignored by git)
 
 If you want to explore code paths mentioned in this README, start with:
+
 - [PureQ/](PureQ) — UI and app logic
 - [PureQDriver/](PureQDriver) — virtual device implementation
 - [Scripts/install-pureq-driver.sh](Scripts/install-pureq-driver.sh) — driver install helper
