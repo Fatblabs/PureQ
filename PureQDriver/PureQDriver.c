@@ -8,6 +8,7 @@
 #include <CoreAudio/HostTime.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <os/log.h>
 #include <stddef.h>
@@ -23,16 +24,21 @@
 #define kPureQDeviceUID "Sean-s-Apps.PureQ.driver.device"
 #define kPureQModelUID "Sean-s-Apps.PureQ.driver.model"
 #define PUREQ_DRIVER_DEBUG 0
-#define kPureQSharedRingPath "/tmp/PureQAudioRing.v1"
+#define kPureQFallbackSharedRingPath "/tmp/PureQAudioRing.v1"
 #define kPureQSharedRingMagic 0x50555251u
 #define kPureQSharedRingVersion 1u
+#define kPureQPropertySharedRingPath 'pqsp'
+#define kPureQDevicePropertyVirtualMainVolume 'vmvc'
+#define kPureQDevicePropertyVirtualMainBalance 'vmbc'
 
 enum {
     kPureQObjectPlugin = kAudioObjectPlugInObject,
     kPureQObjectBox = 2,
     kPureQObjectDevice = 3,
     kPureQObjectOutputStream = 4,
-    kPureQObjectInputStream = 5
+    kPureQObjectInputStream = 5,
+    kPureQObjectOutputVolumeControl = 6,
+    kPureQObjectOutputMuteControl = 7
 };
 
 static AudioServerPlugInHostRef gHost = NULL;
@@ -48,6 +54,11 @@ static const Float64 kPureQMinimumSampleRate = 44100.0;
 static const Float64 kPureQMaximumSampleRate = 384000.0;
 static const UInt32 kPureQMinimumBufferFrameSize = 64;
 static const UInt32 kPureQMaximumBufferFrameSize = 4096;
+static const AudioObjectID kPureQLastFixedObject = kPureQObjectOutputMuteControl;
+static const Float32 kPureQMinimumVolumeDecibels = -64.0f;
+static const Float32 kPureQMaximumVolumeDecibels = 0.0f;
+static atomic_uint gOutputVolumeMillion = 1000000;
+static atomic_uint gOutputMuted = 0;
 
 #define kPureQLoopbackCapacityFrames (384000 * 2)
 
@@ -61,11 +72,19 @@ typedef struct PureQSharedAudioRing {
     atomic_uint version;
     atomic_uint capacityFrames;
     atomic_uint channels;
+    atomic_uint frameCount;
+    UInt32 reserved0;
     atomic_ullong writeCounter;
-    Float32 samples[kPureQLoopbackCapacityFrames * 2];
+    Float64 sampleRate;
+    UInt8 padding[24];
+    Float32 samples[];
 } PureQSharedAudioRing;
 
 static PureQSharedAudioRing* gSharedRing = NULL;
+static int gSharedRingDescriptor = -1;
+static size_t gSharedRingMappedSize = 0;
+static char gSharedRingPath[PATH_MAX] = "";
+static uint64_t gSharedRingWriteCounter = 0;
 
 static AudioStreamBasicDescription PureQStreamDescription(void)
 {
@@ -123,6 +142,69 @@ static UInt32 PureQClampBufferFrameSize(UInt32 frameSize)
     return frameSize;
 }
 
+static Float32 PureQClampFloat32(Float32 value, Float32 minimumValue, Float32 maximumValue)
+{
+    if (!isfinite(value)) {
+        return minimumValue;
+    }
+    if (value < minimumValue) {
+        return minimumValue;
+    }
+    if (value > maximumValue) {
+        return maximumValue;
+    }
+    return value;
+}
+
+static Float32 PureQVolumeToDecibels(Float32 volume)
+{
+    Float32 minimumVolume = powf(10.0f, kPureQMinimumVolumeDecibels / 20.0f);
+    if (volume <= minimumVolume) {
+        return kPureQMinimumVolumeDecibels;
+    }
+    return 20.0f * log10f(volume);
+}
+
+static Float32 PureQVolumeFromDecibels(Float32 decibels)
+{
+    if (decibels <= kPureQMinimumVolumeDecibels) {
+        return 0.0f;
+    }
+    return powf(10.0f, decibels / 20.0f);
+}
+
+static Float32 PureQVolumeToScalar(Float32 volume)
+{
+    Float32 decibels = PureQVolumeToDecibels(volume);
+    return (decibels - kPureQMinimumVolumeDecibels) / (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels);
+}
+
+static Float32 PureQVolumeFromScalar(Float32 scalar)
+{
+    scalar = PureQClampFloat32(scalar, 0.0f, 1.0f);
+    Float32 decibels = scalar * (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels) + kPureQMinimumVolumeDecibels;
+    return PureQVolumeFromDecibels(decibels);
+}
+
+static UInt32 PureQVolumeToMillion(Float32 volume)
+{
+    volume = PureQClampFloat32(volume, 0.0f, 1.0f);
+    return (UInt32)lrintf(volume * 1000000.0f);
+}
+
+static Float32 PureQCurrentOutputVolume(void)
+{
+    return (Float32)atomic_load_explicit(&gOutputVolumeMillion, memory_order_relaxed) / 1000000.0f;
+}
+
+static Float32 PureQCurrentOutputGain(void)
+{
+    if (atomic_load_explicit(&gOutputMuted, memory_order_relaxed) != 0) {
+        return 0.0f;
+    }
+    return PureQCurrentOutputVolume();
+}
+
 static AudioStreamRangedDescription PureQStreamRangedDescription(void)
 {
     AudioStreamRangedDescription description;
@@ -137,12 +219,12 @@ static Boolean PureQIsPluginObject(AudioObjectID objectID)
     if (objectID == kPureQObjectPlugin || objectID == gPlugInObjectID) {
         return true;
     }
-    return objectID > kPureQObjectInputStream;
+    return objectID > kPureQLastFixedObject;
 }
 
 static void PureQRememberPluginObject(AudioObjectID objectID)
 {
-    if (objectID > kPureQObjectInputStream) {
+    if (objectID > kPureQLastFixedObject) {
         gPlugInObjectID = objectID;
     }
 }
@@ -153,7 +235,9 @@ static Boolean PureQObjectExists(AudioObjectID objectID)
         objectID == kPureQObjectBox ||
         objectID == kPureQObjectDevice ||
         objectID == kPureQObjectOutputStream ||
-        objectID == kPureQObjectInputStream;
+        objectID == kPureQObjectInputStream ||
+        objectID == kPureQObjectOutputVolumeControl ||
+        objectID == kPureQObjectOutputMuteControl;
 }
 
 static AudioClassID PureQObjectClass(AudioObjectID objectID)
@@ -168,6 +252,10 @@ static AudioClassID PureQObjectClass(AudioObjectID objectID)
     case kPureQObjectOutputStream:
     case kPureQObjectInputStream:
         return kAudioStreamClassID;
+    case kPureQObjectOutputVolumeControl:
+        return kAudioVolumeControlClassID;
+    case kPureQObjectOutputMuteControl:
+        return kAudioMuteControlClassID;
     default:
         return PureQIsPluginObject(objectID) ? kAudioPlugInClassID : kAudioObjectClassID;
     }
@@ -182,6 +270,8 @@ static AudioObjectID PureQObjectOwner(AudioObjectID objectID)
         return gPlugInObjectID;
     case kPureQObjectOutputStream:
     case kPureQObjectInputStream:
+    case kPureQObjectOutputVolumeControl:
+    case kPureQObjectOutputMuteControl:
         return kPureQObjectDevice;
     default:
         return kAudioObjectUnknown;
@@ -201,6 +291,10 @@ static CFStringRef PureQObjectName(AudioObjectID objectID)
         return CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ Output Stream"));
     case kPureQObjectInputStream:
         return CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ Input Stream"));
+    case kPureQObjectOutputVolumeControl:
+        return CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ Output Volume"));
+    case kPureQObjectOutputMuteControl:
+        return CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ Output Mute"));
     default:
         return PureQIsPluginObject(objectID) ? CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ Driver")) : CFStringCreateCopy(kCFAllocatorDefault, CFSTR("PureQ"));
     }
@@ -262,6 +356,11 @@ static Boolean PureQWriteFloat64(UInt32 inDataSize, UInt32* outDataSize, void* o
     return PureQWriteData(inDataSize, outDataSize, outData, &value, sizeof(value));
 }
 
+static Boolean PureQWriteFloat32(UInt32 inDataSize, UInt32* outDataSize, void* outData, Float32 value)
+{
+    return PureQWriteData(inDataSize, outDataSize, outData, &value, sizeof(value));
+}
+
 static Boolean PureQWriteCFString(UInt32 inDataSize, UInt32* outDataSize, void* outData, CFStringRef value)
 {
     if (inDataSize < sizeof(CFStringRef)) {
@@ -283,9 +382,100 @@ static void PureQLoopbackReset(void)
     atomic_store_explicit(&gLoopbackWriteFrame, 0, memory_order_relaxed);
     atomic_store_explicit(&gLoopbackAvailableFrames, 0, memory_order_relaxed);
     if (gSharedRing != NULL) {
-        memset(gSharedRing->samples, 0, sizeof(gSharedRing->samples));
+        memset(gSharedRing->samples, 0, kPureQLoopbackCapacityFrames * 2 * sizeof(Float32));
+        atomic_store_explicit(&gSharedRing->frameCount, 0, memory_order_release);
         atomic_store_explicit(&gSharedRing->writeCounter, 0, memory_order_release);
+        gSharedRing->sampleRate = gSampleRate;
+        gSharedRingWriteCounter = 0;
     }
+}
+
+static size_t PureQSharedRingSize(void)
+{
+    return offsetof(PureQSharedAudioRing, samples) + kPureQLoopbackCapacityFrames * 2 * sizeof(Float32);
+}
+
+static void PureQInitializeSharedRingHeader(void)
+{
+    if (gSharedRing == NULL) {
+        return;
+    }
+
+    atomic_store_explicit(&gSharedRing->magic, kPureQSharedRingMagic, memory_order_release);
+    atomic_store_explicit(&gSharedRing->version, kPureQSharedRingVersion, memory_order_release);
+    atomic_store_explicit(&gSharedRing->capacityFrames, kPureQLoopbackCapacityFrames, memory_order_release);
+    atomic_store_explicit(&gSharedRing->channels, 2, memory_order_release);
+    atomic_store_explicit(&gSharedRing->frameCount, 0, memory_order_release);
+    atomic_store_explicit(&gSharedRing->writeCounter, 0, memory_order_release);
+    gSharedRing->reserved0 = 0;
+    gSharedRing->sampleRate = gSampleRate;
+    gSharedRingWriteCounter = 0;
+}
+
+static void PureQCloseSharedRing(void)
+{
+    if (gSharedRing != NULL && gSharedRingMappedSize > 0) {
+        munmap(gSharedRing, gSharedRingMappedSize);
+    }
+    gSharedRing = NULL;
+    gSharedRingMappedSize = 0;
+    gSharedRingWriteCounter = 0;
+
+    if (gSharedRingDescriptor >= 0) {
+        close(gSharedRingDescriptor);
+    }
+    gSharedRingDescriptor = -1;
+    gSharedRingPath[0] = '\0';
+}
+
+static Boolean PureQMapSharedRingPath(const char* path, Boolean createIfNeeded)
+{
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    if (gSharedRing != NULL && strncmp(gSharedRingPath, path, sizeof(gSharedRingPath)) == 0) {
+        PureQInitializeSharedRingHeader();
+        memset(gSharedRing->samples, 0, kPureQLoopbackCapacityFrames * 2 * sizeof(Float32));
+        return true;
+    }
+
+    int flags = createIfNeeded ? (O_CREAT | O_RDWR) : O_RDWR;
+    int descriptor = open(path, flags, 0666);
+    if (descriptor < 0) {
+        return false;
+    }
+
+    size_t ringSize = PureQSharedRingSize();
+    if (createIfNeeded && ftruncate(descriptor, (off_t)ringSize) != 0) {
+        close(descriptor);
+        return false;
+    }
+    if (createIfNeeded) {
+        fchmod(descriptor, 0666);
+    }
+
+    void* mapping = mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
+    if (mapping == MAP_FAILED) {
+        close(descriptor);
+        return false;
+    }
+
+    int oldDescriptor = gSharedRingDescriptor;
+    // Swap to the new mapping before releasing the old descriptor. The previous
+    // mmap is intentionally left alive so a concurrent WriteMix callback cannot
+    // touch unmapped memory while the app is reconnecting shared capture.
+    gSharedRingDescriptor = descriptor;
+    gSharedRingMappedSize = ringSize;
+    gSharedRing = (PureQSharedAudioRing*)mapping;
+    strncpy(gSharedRingPath, path, sizeof(gSharedRingPath) - 1);
+    gSharedRingPath[sizeof(gSharedRingPath) - 1] = '\0';
+    PureQInitializeSharedRingHeader();
+    memset(gSharedRing->samples, 0, kPureQLoopbackCapacityFrames * 2 * sizeof(Float32));
+    if (oldDescriptor >= 0) {
+        close(oldDescriptor);
+    }
+    return true;
 }
 
 static void PureQEnsureSharedRing(void)
@@ -294,54 +484,32 @@ static void PureQEnsureSharedRing(void)
         return;
     }
 
-    int descriptor = open(kPureQSharedRingPath, O_CREAT | O_RDWR, 0666);
-    if (descriptor < 0) {
-        return;
-    }
-
-    size_t ringSize = sizeof(PureQSharedAudioRing);
-    if (ftruncate(descriptor, (off_t)ringSize) != 0) {
-        close(descriptor);
-        return;
-    }
-    fchmod(descriptor, 0666);
-
-    void* mapping = mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
-    close(descriptor);
-    if (mapping == MAP_FAILED) {
-        return;
-    }
-
-    gSharedRing = (PureQSharedAudioRing*)mapping;
-    atomic_store_explicit(&gSharedRing->magic, kPureQSharedRingMagic, memory_order_release);
-    atomic_store_explicit(&gSharedRing->version, kPureQSharedRingVersion, memory_order_release);
-    atomic_store_explicit(&gSharedRing->capacityFrames, kPureQLoopbackCapacityFrames, memory_order_release);
-    atomic_store_explicit(&gSharedRing->channels, 2, memory_order_release);
-    memset(gSharedRing->samples, 0, sizeof(gSharedRing->samples));
-    atomic_store_explicit(&gSharedRing->writeCounter, 0, memory_order_release);
+    (void)PureQMapSharedRingPath(kPureQFallbackSharedRingPath, true);
 }
 
-static void PureQSharedRingWrite(const Float32* samples, UInt32 frames)
+static void PureQSharedRingWrite(const Float32* samples, UInt32 frames, Float32 gain)
 {
     if (samples == NULL || frames == 0) {
         return;
     }
 
-    PureQEnsureSharedRing();
     if (gSharedRing == NULL) {
         return;
     }
 
-    uint64_t writeCounter = atomic_load_explicit(&gSharedRing->writeCounter, memory_order_acquire);
+    uint64_t writeCounter = gSharedRingWriteCounter;
     for (UInt32 frame = 0; frame < frames; frame++) {
         uint64_t targetFrame = (writeCounter + frame) % kPureQLoopbackCapacityFrames;
         UInt32 ringOffset = (UInt32)targetFrame * 2;
         UInt32 sampleOffset = frame * 2;
 
-        gSharedRing->samples[ringOffset] = samples[sampleOffset];
-        gSharedRing->samples[ringOffset + 1] = samples[sampleOffset + 1];
+        gSharedRing->samples[ringOffset] = samples[sampleOffset] * gain;
+        gSharedRing->samples[ringOffset + 1] = samples[sampleOffset + 1] * gain;
     }
-    atomic_store_explicit(&gSharedRing->writeCounter, writeCounter + frames, memory_order_release);
+    gSharedRingWriteCounter = writeCounter + frames;
+    gSharedRing->sampleRate = gSampleRate;
+    atomic_store_explicit(&gSharedRing->frameCount, frames, memory_order_release);
+    atomic_store_explicit(&gSharedRing->writeCounter, gSharedRingWriteCounter, memory_order_release);
 }
 
 static void PureQLoopbackWrite(const Float32* samples, UInt32 frames)
@@ -350,15 +518,16 @@ static void PureQLoopbackWrite(const Float32* samples, UInt32 frames)
         return;
     }
 
-    PureQSharedRingWrite(samples, frames);
+    Float32 gain = PureQCurrentOutputGain();
+    PureQSharedRingWrite(samples, frames, 1.0f);
 
     for (UInt32 frame = 0; frame < frames; frame++) {
         UInt32 writeFrame = atomic_load_explicit(&gLoopbackWriteFrame, memory_order_relaxed);
         UInt32 ringOffset = writeFrame * 2;
         UInt32 sampleOffset = frame * 2;
 
-        gLoopbackRing[ringOffset] = samples[sampleOffset];
-        gLoopbackRing[ringOffset + 1] = samples[sampleOffset + 1];
+        gLoopbackRing[ringOffset] = samples[sampleOffset] * gain;
+        gLoopbackRing[ringOffset + 1] = samples[sampleOffset + 1] * gain;
 
         UInt32 nextWriteFrame = (writeFrame + 1) % kPureQLoopbackCapacityFrames;
         atomic_store_explicit(&gLoopbackWriteFrame, nextWriteFrame, memory_order_release);
@@ -415,6 +584,25 @@ static void PureQNotifySelector(AudioObjectID objectID, AudioObjectPropertySelec
     address.mScope = scope;
     address.mElement = kAudioObjectPropertyElementMain;
     PureQNotifyProperty(objectID, &address);
+}
+
+static void PureQNotifyOutputVolumeChanged(void)
+{
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput);
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeGlobal);
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyVolumeDecibels, kAudioObjectPropertyScopeOutput);
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyVolumeDecibels, kAudioObjectPropertyScopeGlobal);
+    PureQNotifySelector(kPureQObjectDevice, kPureQDevicePropertyVirtualMainVolume, kAudioObjectPropertyScopeOutput);
+    PureQNotifySelector(kPureQObjectDevice, kPureQDevicePropertyVirtualMainVolume, kAudioObjectPropertyScopeGlobal);
+    PureQNotifySelector(kPureQObjectOutputVolumeControl, kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal);
+    PureQNotifySelector(kPureQObjectOutputVolumeControl, kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal);
+}
+
+static void PureQNotifyOutputMuteChanged(void)
+{
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput);
+    PureQNotifySelector(kPureQObjectDevice, kAudioDevicePropertyMute, kAudioObjectPropertyScopeGlobal);
+    PureQNotifySelector(kPureQObjectOutputMuteControl, kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal);
 }
 
 static void PureQResetTiming(void)
@@ -682,6 +870,15 @@ static Boolean STDMETHODCALLTYPE PureQHasProperty(AudioServerPlugInDriverRef inD
         case kAudioDevicePropertyBufferFrameSizeRange:
         case kAudioDevicePropertyUsesVariableBufferFrameSizes:
         case kAudioDevicePropertyActualSampleRate:
+        case kPureQPropertySharedRingPath:
+        case kAudioDevicePropertyVolumeScalar:
+        case kAudioDevicePropertyVolumeDecibels:
+        case kAudioDevicePropertyVolumeRangeDecibels:
+        case kAudioDevicePropertyVolumeScalarToDecibels:
+        case kAudioDevicePropertyVolumeDecibelsToScalar:
+        case kAudioDevicePropertyMute:
+        case kPureQDevicePropertyVirtualMainVolume:
+        case kPureQDevicePropertyVirtualMainBalance:
             return true;
         default:
             return false;
@@ -699,6 +896,32 @@ static Boolean STDMETHODCALLTYPE PureQHasProperty(AudioServerPlugInDriverRef inD
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyPhysicalFormat:
         case kAudioStreamPropertyAvailablePhysicalFormats:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (inObjectID == kPureQObjectOutputVolumeControl) {
+        switch (inAddress->mSelector) {
+        case kAudioControlPropertyScope:
+        case kAudioControlPropertyElement:
+        case kAudioLevelControlPropertyScalarValue:
+        case kAudioLevelControlPropertyDecibelValue:
+        case kAudioLevelControlPropertyDecibelRange:
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+        case kAudioLevelControlPropertyConvertDecibelsToScalar:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (inObjectID == kPureQObjectOutputMuteControl) {
+        switch (inAddress->mSelector) {
+        case kAudioControlPropertyScope:
+        case kAudioControlPropertyElement:
+        case kAudioBooleanControlPropertyValue:
             return true;
         default:
             return false;
@@ -723,7 +946,21 @@ static OSStatus STDMETHODCALLTYPE PureQIsPropertySettable(AudioServerPlugInDrive
     }
     if (inObjectID == kPureQObjectDevice &&
         (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate ||
-         inAddress->mSelector == kAudioDevicePropertyBufferFrameSize)) {
+         inAddress->mSelector == kAudioDevicePropertyBufferFrameSize ||
+         inAddress->mSelector == kPureQPropertySharedRingPath ||
+         inAddress->mSelector == kAudioDevicePropertyVolumeScalar ||
+         inAddress->mSelector == kAudioDevicePropertyVolumeDecibels ||
+         inAddress->mSelector == kAudioDevicePropertyMute ||
+         inAddress->mSelector == kPureQDevicePropertyVirtualMainVolume)) {
+        *outIsSettable = true;
+    }
+    if (inObjectID == kPureQObjectOutputVolumeControl &&
+        (inAddress->mSelector == kAudioLevelControlPropertyScalarValue ||
+         inAddress->mSelector == kAudioLevelControlPropertyDecibelValue)) {
+        *outIsSettable = true;
+    }
+    if (inObjectID == kPureQObjectOutputMuteControl &&
+        inAddress->mSelector == kAudioBooleanControlPropertyValue) {
         *outIsSettable = true;
     }
     return PureQHasProperty(inDriver, inObjectID, inClientProcessID, inAddress) ? noErr : kAudioHardwareUnknownPropertyError;
@@ -751,6 +988,7 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyDataSize(AudioServerPlugInDriv
     case kAudioBoxPropertyBoxUID:
     case kAudioDevicePropertyDeviceUID:
     case kAudioDevicePropertyModelUID:
+    case kPureQPropertySharedRingPath:
         *outDataSize = sizeof(CFStringRef);
         return noErr;
     case kAudioObjectPropertyBaseClass:
@@ -778,7 +1016,23 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyDataSize(AudioServerPlugInDriv
     case kAudioStreamPropertyDirection:
     case kAudioStreamPropertyTerminalType:
     case kAudioStreamPropertyStartingChannel:
+    case kAudioControlPropertyScope:
+    case kAudioControlPropertyElement:
+    case kAudioBooleanControlPropertyValue:
+    case kAudioDevicePropertyMute:
         *outDataSize = sizeof(UInt32);
+        return noErr;
+    case kAudioLevelControlPropertyScalarValue:
+    case kAudioLevelControlPropertyDecibelValue:
+    case kAudioLevelControlPropertyConvertScalarToDecibels:
+    case kAudioLevelControlPropertyConvertDecibelsToScalar:
+    case kAudioDevicePropertyVolumeScalar:
+    case kAudioDevicePropertyVolumeDecibels:
+    case kAudioDevicePropertyVolumeScalarToDecibels:
+    case kAudioDevicePropertyVolumeDecibelsToScalar:
+    case kPureQDevicePropertyVirtualMainVolume:
+    case kPureQDevicePropertyVirtualMainBalance:
+        *outDataSize = sizeof(Float32);
         return noErr;
     case kAudioDevicePropertyNominalSampleRate:
     case kAudioDevicePropertyActualSampleRate:
@@ -786,6 +1040,8 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyDataSize(AudioServerPlugInDriv
         return noErr;
     case kAudioDevicePropertyAvailableNominalSampleRates:
     case kAudioDevicePropertyBufferFrameSizeRange:
+    case kAudioLevelControlPropertyDecibelRange:
+    case kAudioDevicePropertyVolumeRangeDecibels:
         *outDataSize = sizeof(AudioValueRange);
         return noErr;
     case kAudioStreamPropertyAvailableVirtualFormats:
@@ -805,7 +1061,7 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyDataSize(AudioServerPlugInDriv
         } else if (inObjectID == kPureQObjectBox) {
             *outDataSize = 0;
         } else if (inObjectID == kPureQObjectDevice) {
-            *outDataSize = 2 * sizeof(AudioObjectID);
+            *outDataSize = 4 * sizeof(AudioObjectID);
         } else {
             *outDataSize = 0;
         }
@@ -818,9 +1074,11 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyDataSize(AudioServerPlugInDriv
         *outDataSize = sizeof(AudioObjectID);
         return noErr;
     case kAudioPlugInPropertyClockDeviceList:
-    case kAudioObjectPropertyControlList:
     case kAudioObjectPropertyCustomPropertyInfoList:
         *outDataSize = 0;
+        return noErr;
+    case kAudioObjectPropertyControlList:
+        *outDataSize = inObjectID == kPureQObjectDevice ? 2 * sizeof(AudioObjectID) : 0;
         return noErr;
     case kAudioPlugInPropertyTranslateUIDToBox:
     case kAudioPlugInPropertyTranslateUIDToDevice:
@@ -858,6 +1116,12 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyData(AudioServerPlugInDriverRe
     *outDataSize = 0;
     switch (inAddress->mSelector) {
     case kAudioObjectPropertyBaseClass:
+        if (inObjectID == kPureQObjectOutputVolumeControl) {
+            return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioLevelControlClassID) ? noErr : kAudioHardwareBadPropertySizeError;
+        }
+        if (inObjectID == kPureQObjectOutputMuteControl) {
+            return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioBooleanControlClassID) ? noErr : kAudioHardwareBadPropertySizeError;
+        }
         return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioObjectClassID) ? noErr : kAudioHardwareBadPropertySizeError;
     case kAudioObjectPropertyClass:
         return PureQWriteUInt32(inDataSize, outDataSize, outData, PureQObjectClass(inObjectID)) ? noErr : kAudioHardwareBadPropertySizeError;
@@ -877,7 +1141,12 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyData(AudioServerPlugInDriverRe
             return noErr;
         }
         if (inObjectID == kPureQObjectDevice) {
-            AudioObjectID objects[] = { kPureQObjectOutputStream, kPureQObjectInputStream };
+            AudioObjectID objects[] = {
+                kPureQObjectOutputStream,
+                kPureQObjectInputStream,
+                kPureQObjectOutputVolumeControl,
+                kPureQObjectOutputMuteControl
+            };
             return PureQWriteData(inDataSize, outDataSize, outData, objects, sizeof(objects)) ? noErr : kAudioHardwareBadPropertySizeError;
         }
         *outDataSize = 0;
@@ -915,8 +1184,14 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyData(AudioServerPlugInDriverRe
         return PureQWriteAudioObjectID(inDataSize, outDataSize, outData, box) ? noErr : kAudioHardwareBadPropertySizeError;
     }
     case kAudioPlugInPropertyClockDeviceList:
-    case kAudioObjectPropertyControlList:
     case kAudioObjectPropertyCustomPropertyInfoList:
+        *outDataSize = 0;
+        return noErr;
+    case kAudioObjectPropertyControlList:
+        if (inObjectID == kPureQObjectDevice) {
+            AudioObjectID controls[] = { kPureQObjectOutputVolumeControl, kPureQObjectOutputMuteControl };
+            return PureQWriteData(inDataSize, outDataSize, outData, controls, sizeof(controls)) ? noErr : kAudioHardwareBadPropertySizeError;
+        }
         *outDataSize = 0;
         return noErr;
     case kAudioBoxPropertyBoxUID:
@@ -940,6 +1215,8 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyData(AudioServerPlugInDriverRe
         return PureQWriteCFString(inDataSize, outDataSize, outData, CFStringCreateWithCString(kCFAllocatorDefault, kPureQDeviceUID, kCFStringEncodingUTF8)) ? noErr : kAudioHardwareBadPropertySizeError;
     case kAudioDevicePropertyModelUID:
         return PureQWriteCFString(inDataSize, outDataSize, outData, CFStringCreateWithCString(kCFAllocatorDefault, kPureQModelUID, kCFStringEncodingUTF8)) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kPureQPropertySharedRingPath:
+        return PureQWriteCFString(inDataSize, outDataSize, outData, CFStringCreateWithCString(kCFAllocatorDefault, gSharedRingPath, kCFStringEncodingUTF8)) ? noErr : kAudioHardwareBadPropertySizeError;
     case kAudioDevicePropertyTransportType:
         return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioDeviceTransportTypeVirtual) ? noErr : kAudioHardwareBadPropertySizeError;
     case kAudioDevicePropertyRelatedDevices: {
@@ -1016,6 +1293,69 @@ static OSStatus STDMETHODCALLTYPE PureQGetPropertyData(AudioServerPlugInDriverRe
         AudioStreamRangedDescription description = PureQStreamRangedDescription();
         return PureQWriteData(inDataSize, outDataSize, outData, &description, sizeof(description)) ? noErr : kAudioHardwareBadPropertySizeError;
     }
+    case kAudioControlPropertyScope:
+        return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioObjectPropertyScopeOutput) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioControlPropertyElement:
+        return PureQWriteUInt32(inDataSize, outDataSize, outData, kAudioObjectPropertyElementMain) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioDevicePropertyVolumeScalar:
+    case kPureQDevicePropertyVirtualMainVolume:
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, PureQVolumeToScalar(PureQCurrentOutputVolume())) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioDevicePropertyVolumeDecibels:
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, PureQVolumeToDecibels(PureQCurrentOutputVolume())) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioDevicePropertyVolumeRangeDecibels: {
+        AudioValueRange range;
+        range.mMinimum = kPureQMinimumVolumeDecibels;
+        range.mMaximum = kPureQMaximumVolumeDecibels;
+        return PureQWriteData(inDataSize, outDataSize, outData, &range, sizeof(range)) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioDevicePropertyVolumeScalarToDecibels: {
+        if (inDataSize < sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 scalar = PureQClampFloat32(*((Float32*)outData), 0.0f, 1.0f);
+        Float32 decibels = scalar * (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels) + kPureQMinimumVolumeDecibels;
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, decibels) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioDevicePropertyVolumeDecibelsToScalar: {
+        if (inDataSize < sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 decibels = PureQClampFloat32(*((Float32*)outData), kPureQMinimumVolumeDecibels, kPureQMaximumVolumeDecibels);
+        Float32 scalar = (decibels - kPureQMinimumVolumeDecibels) / (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels);
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, scalar) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioDevicePropertyMute:
+        return PureQWriteUInt32(inDataSize, outDataSize, outData, atomic_load_explicit(&gOutputMuted, memory_order_relaxed) != 0 ? 1 : 0) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kPureQDevicePropertyVirtualMainBalance:
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, 0.5f) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioLevelControlPropertyScalarValue:
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, PureQVolumeToScalar(PureQCurrentOutputVolume())) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioLevelControlPropertyDecibelValue:
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, PureQVolumeToDecibels(PureQCurrentOutputVolume())) ? noErr : kAudioHardwareBadPropertySizeError;
+    case kAudioLevelControlPropertyDecibelRange: {
+        AudioValueRange range;
+        range.mMinimum = kPureQMinimumVolumeDecibels;
+        range.mMaximum = kPureQMaximumVolumeDecibels;
+        return PureQWriteData(inDataSize, outDataSize, outData, &range, sizeof(range)) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioLevelControlPropertyConvertScalarToDecibels: {
+        if (inDataSize < sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 scalar = PureQClampFloat32(*((Float32*)outData), 0.0f, 1.0f);
+        Float32 decibels = scalar * (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels) + kPureQMinimumVolumeDecibels;
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, decibels) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioLevelControlPropertyConvertDecibelsToScalar: {
+        if (inDataSize < sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 decibels = PureQClampFloat32(*((Float32*)outData), kPureQMinimumVolumeDecibels, kPureQMaximumVolumeDecibels);
+        Float32 scalar = (decibels - kPureQMinimumVolumeDecibels) / (kPureQMaximumVolumeDecibels - kPureQMinimumVolumeDecibels);
+        return PureQWriteFloat32(inDataSize, outDataSize, outData, scalar) ? noErr : kAudioHardwareBadPropertySizeError;
+    }
+    case kAudioBooleanControlPropertyValue:
+        return PureQWriteUInt32(inDataSize, outDataSize, outData, atomic_load_explicit(&gOutputMuted, memory_order_relaxed) != 0 ? 1 : 0) ? noErr : kAudioHardwareBadPropertySizeError;
     default:
         return kAudioHardwareUnknownPropertyError;
     }
@@ -1039,11 +1379,74 @@ static OSStatus STDMETHODCALLTYPE PureQSetPropertyData(AudioServerPlugInDriverRe
         return noErr;
     }
 
+    if (inObjectID == kPureQObjectOutputVolumeControl) {
+        Float32 volume = PureQCurrentOutputVolume();
+
+        switch (inAddress->mSelector) {
+        case kAudioLevelControlPropertyScalarValue:
+            if (inDataSize != sizeof(Float32)) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            volume = PureQVolumeFromScalar(*((const Float32*)inData));
+            break;
+        case kAudioLevelControlPropertyDecibelValue:
+            if (inDataSize != sizeof(Float32)) {
+                return kAudioHardwareBadPropertySizeError;
+            }
+            volume = PureQVolumeFromDecibels(PureQClampFloat32(*((const Float32*)inData), kPureQMinimumVolumeDecibels, kPureQMaximumVolumeDecibels));
+            break;
+        default:
+            return kAudioHardwareUnknownPropertyError;
+        }
+
+        atomic_store_explicit(&gOutputVolumeMillion, PureQVolumeToMillion(volume), memory_order_relaxed);
+        PureQNotifyOutputVolumeChanged();
+        return noErr;
+    }
+
+    if (inObjectID == kPureQObjectOutputMuteControl) {
+        if (inAddress->mSelector != kAudioBooleanControlPropertyValue) {
+            return kAudioHardwareUnknownPropertyError;
+        }
+        if (inDataSize != sizeof(UInt32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        atomic_store_explicit(&gOutputMuted, *((const UInt32*)inData) != 0 ? 1 : 0, memory_order_relaxed);
+        PureQNotifyOutputMuteChanged();
+        return noErr;
+    }
+
     if (inObjectID != kPureQObjectDevice) {
         return kAudioHardwareBadObjectError;
     }
 
     switch (inAddress->mSelector) {
+    case kAudioDevicePropertyVolumeScalar:
+    case kPureQDevicePropertyVirtualMainVolume: {
+        if (inDataSize != sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 volume = PureQVolumeFromScalar(*((const Float32*)inData));
+        atomic_store_explicit(&gOutputVolumeMillion, PureQVolumeToMillion(volume), memory_order_relaxed);
+        PureQNotifyOutputVolumeChanged();
+        return noErr;
+    }
+    case kAudioDevicePropertyVolumeDecibels: {
+        if (inDataSize != sizeof(Float32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        Float32 volume = PureQVolumeFromDecibels(PureQClampFloat32(*((const Float32*)inData), kPureQMinimumVolumeDecibels, kPureQMaximumVolumeDecibels));
+        atomic_store_explicit(&gOutputVolumeMillion, PureQVolumeToMillion(volume), memory_order_relaxed);
+        PureQNotifyOutputVolumeChanged();
+        return noErr;
+    }
+    case kAudioDevicePropertyMute:
+        if (inDataSize != sizeof(UInt32)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+        atomic_store_explicit(&gOutputMuted, *((const UInt32*)inData) != 0 ? 1 : 0, memory_order_relaxed);
+        PureQNotifyOutputMuteChanged();
+        return noErr;
     case kAudioDevicePropertyNominalSampleRate:
         if (inDataSize != sizeof(Float64)) {
             return kAudioHardwareBadPropertySizeError;
@@ -1065,6 +1468,36 @@ static OSStatus STDMETHODCALLTYPE PureQSetPropertyData(AudioServerPlugInDriverRe
         gBufferFrameSize = PureQClampBufferFrameSize(*((const UInt32*)inData));
         PureQNotifyProperty(inObjectID, inAddress);
         return noErr;
+    case kPureQPropertySharedRingPath: {
+        if (inDataSize != sizeof(CFStringRef)) {
+            return kAudioHardwareBadPropertySizeError;
+        }
+
+        CFStringRef path = *((const CFStringRef*)inData);
+        if (path == NULL) {
+            PureQCloseSharedRing();
+            PureQNotifyProperty(inObjectID, inAddress);
+            return noErr;
+        }
+
+        char pathBuffer[PATH_MAX];
+        if (!CFStringGetCString(path, pathBuffer, sizeof(pathBuffer), kCFStringEncodingUTF8)) {
+            return kAudioHardwareIllegalOperationError;
+        }
+
+        if (pathBuffer[0] == '\0') {
+            PureQCloseSharedRing();
+            PureQNotifyProperty(inObjectID, inAddress);
+            return noErr;
+        }
+
+        if (!PureQMapSharedRingPath(pathBuffer, false)) {
+            return kAudioHardwareUnspecifiedError;
+        }
+
+        PureQNotifyProperty(inObjectID, inAddress);
+        return noErr;
+    }
     default:
         return kAudioHardwareUnknownPropertyError;
     }

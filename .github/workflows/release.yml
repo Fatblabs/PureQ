@@ -10,38 +10,38 @@ permissions:
 
 jobs:
   build-and-release:
-    name: Build macOS App & Publish
+    name: Build macOS Installer & Publish
     runs-on: macos-latest
 
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Build Xcode Archive
+      - name: Build Installer Package
         run: |
-          xcodebuild archive \
-            -scheme "PureQ" \
-            -archivePath ./build/PureQ.xcarchive \
-            -configuration Release \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+          chmod +x Scripts/package-pureq.sh Scripts/install-pureq.sh Scripts/uninstall-pureq.sh
+          Scripts/package-pureq.sh
+        env:
+          CONFIGURATION: Release
+          # Public CI builds are unsigned unless you provide Apple signing and
+          # notarization credentials. The .pkg still installs both the app and
+          # the HAL driver, avoiding the source-build echo path.
+          CODE_SIGNING_ALLOWED: NO
+          CODE_SIGNING_REQUIRED: NO
+          CODE_SIGN_IDENTITY: ""
 
-      - name: Package App into DMG
+      - name: Verify Installer Package
         run: |
-          # Create a staging folder for the disk image
-          mkdir -p ./dmg_root
-          
-          # Copy the compiled .app bundle into the staging folder
-          cp -R ./build/PureQ.xcarchive/Products/Applications/PureQ.app ./dmg_root/
-          
-          # Compress the folder into a standard Mac .dmg file
-          hdiutil create -volname "PureQ" -srcfolder ./dmg_root -ov -format UDZO PureQ.dmg
+          pkgutil --check-signature dist/*.pkg || true
+          shasum -a 256 dist/*.pkg > dist/checksums.txt
+          cat dist/checksums.txt
 
-      - name: Create GitHub Release and Upload DMG
+      - name: Create GitHub Release and Upload Installer
         uses: softprops/action-gh-release@v2
         with:
-          files: PureQ.dmg
+          files: |
+            dist/*.pkg
+            dist/checksums.txt
           generate_release_notes: true # Automatically populates release notes with your commit history
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Built-in token provided automatically by GitHub

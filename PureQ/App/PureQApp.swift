@@ -79,6 +79,10 @@ final class PureQWindowController: NSObject, NSWindowDelegate {
 @MainActor
 final class PureQAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !activateExistingInstanceAndQuitIfNeeded() else {
+            return
+        }
+
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 400_000_000)
             if !PureQWindowController.hasVisibleMainWindow {
@@ -98,6 +102,23 @@ final class PureQAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         PureQAppStore.model.flushPersistedState()
+    }
+
+    private func activateExistingInstanceAndQuitIfNeeded() -> Bool {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
+            return false
+        }
+
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        guard let existingApplication = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first(where: { $0.processIdentifier != currentProcessID }) else {
+            return false
+        }
+
+        existingApplication.activate(options: [.activateAllWindows])
+        NSApplication.shared.terminate(nil)
+        return true
     }
 }
 
@@ -121,6 +142,15 @@ struct PureQApp: App {
         }
         .defaultSize(width: 1_120, height: 840)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") {
+                    model.undoActiveScope()
+                }
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(!model.canUndoActiveScope)
+            }
+        }
 
         MenuBarExtra {
             MenuBarView()

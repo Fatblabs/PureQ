@@ -9,682 +9,12 @@ import CoreAudio
 import Foundation
 import SwiftUI
 
-enum EqualizerMode: String, CaseIterable, Identifiable, Codable {
-    case basic = "Basic"
-    case advanced = "Advanced"
-    case expert = "Expert"
-
-    var id: String { rawValue }
-
-    var frequencies: [Double] {
-        switch self {
-        case .basic:
-            return [32, 63, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000]
-        case .advanced:
-            return [25, 40, 63, 100, 160, 250, 400, 630, 1_000, 1_600, 2_500, 4_000, 6_300, 10_000, 16_000]
-        case .expert:
-            return EqualizerBand.standardFrequencies
-        }
-    }
-}
-
-enum EqualizerBandLayout: String, CaseIterable, Identifiable {
-    case bands10
-    case bands31
-    case custom
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .bands10: return "10 Bands"
-        case .bands31: return "31 Bands"
-        case .custom: return "Custom"
-        }
-    }
-}
-
-enum EqualizerSelection: String, CaseIterable, Identifiable, Codable {
-    case manual
-    case bands31
-    case bands10
-    case basic
-    case flat
-    case bassLift
-    case vocalFocus
-    case crispAir
-    case lateNight
-
-    var id: String { rawValue }
-
-    static let profileOptions: [EqualizerSelection] = [
-        .manual,
-        .flat,
-        .bassLift,
-        .vocalFocus,
-        .crispAir,
-        .lateNight
-    ]
-
-    var title: String {
-        switch self {
-        case .manual: return "Manual"
-        case .bands31: return "31 Bands"
-        case .bands10: return "10 Bands"
-        case .basic: return "Basic"
-        case .flat: return "Flat"
-        case .bassLift: return "Bass Lift"
-        case .vocalFocus: return "Vocal Focus"
-        case .crispAir: return "Crisp Air"
-        case .lateNight: return "Late Night"
-        }
-    }
-}
-
-enum BandShape: String, CaseIterable, Identifiable, Codable {
-    case bell
-    case shelf
-    case notch
-
-    var id: String { rawValue }
-
-    var systemImage: String {
-        switch self {
-        case .bell: return "alternatingcurrent"
-        case .shelf: return "chart.line.uptrend.xyaxis"
-        case .notch: return "line.3.horizontal.decrease"
-        }
-    }
-}
-
-struct EqualizerBand: Identifiable, Equatable, Codable {
-    let id: UUID
-    let slotFrequency: Double
-    var frequency: Double
-    var gain: Double
-    var q: Double
-    var isEnabled: Bool
-    var isStereoLinked: Bool
-    var shape: BandShape
-    var isCustom: Bool
-
-    init(
-        slotFrequency: Double? = nil,
-        frequency: Double,
-        gain: Double = 0,
-        q: Double = 0.5,
-        isEnabled: Bool = true,
-        isStereoLinked: Bool = true,
-        shape: BandShape = .bell,
-        isCustom: Bool = false
-    ) {
-        self.id = UUID()
-        self.slotFrequency = slotFrequency ?? frequency
-        self.frequency = frequency
-        self.gain = gain
-        self.q = q
-        self.isEnabled = isEnabled
-        self.isStereoLinked = isStereoLinked
-        self.shape = shape
-        self.isCustom = isCustom
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id
-        case slotFrequency
-        case frequency
-        case gain
-        case q
-        case isEnabled
-        case isStereoLinked
-        case shape
-        case isCustom
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        frequency = try container.decode(Double.self, forKey: .frequency)
-        slotFrequency = try container.decodeIfPresent(Double.self, forKey: .slotFrequency) ?? frequency
-        gain = try container.decodeIfPresent(Double.self, forKey: .gain) ?? 0
-        q = try container.decodeIfPresent(Double.self, forKey: .q) ?? 0.5
-        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
-        isStereoLinked = try container.decodeIfPresent(Bool.self, forKey: .isStereoLinked) ?? true
-        shape = try container.decodeIfPresent(BandShape.self, forKey: .shape) ?? .bell
-        isCustom = try container.decodeIfPresent(Bool.self, forKey: .isCustom) ?? !Self.isStandardFrequency(slotFrequency)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(slotFrequency, forKey: .slotFrequency)
-        try container.encode(frequency, forKey: .frequency)
-        try container.encode(gain, forKey: .gain)
-        try container.encode(q, forKey: .q)
-        try container.encode(isEnabled, forKey: .isEnabled)
-        try container.encode(isStereoLinked, forKey: .isStereoLinked)
-        try container.encode(shape, forKey: .shape)
-        try container.encode(isCustom, forKey: .isCustom)
-    }
-
-    static let standardFrequencies: [Double] = [
-        20, 25, 32, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
-        800, 1_000, 1_250, 1_600, 2_000, 2_500, 3_150, 4_000, 5_000, 6_300, 8_000,
-        10_000, 12_500, 16_000, 20_000
-    ]
-
-    static func makeStandardBands() -> [EqualizerBand] {
-        standardFrequencies.map { EqualizerBand(frequency: $0) }
-    }
-
-    static func isStandardFrequency(_ frequency: Double) -> Bool {
-        standardFrequencies.contains { abs($0 - frequency) < 0.01 }
-    }
-
-    static func label(for frequency: Double) -> String {
-        if frequency >= 1_000 {
-            let value = frequency / 1_000
-            if value.rounded() == value {
-                return "\(Int(value))KHz"
-            }
-            return String(format: "%.1fKHz", value)
-        }
-        return "\(Int(frequency.rounded()))Hz"
-    }
-}
-
-enum OutputLockStatus {
-    case unlocked
-    case locked
-    case guarding
-    case needsAttention
-
-    var title: String {
-        switch self {
-        case .unlocked: return "Unlocked"
-        case .locked: return "Locked"
-        case .guarding: return "Guarding"
-        case .needsAttention: return "Needs attention"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .unlocked: return "speaker.wave.2"
-        case .locked: return "lock.fill"
-        case .guarding: return "speaker.slash.fill"
-        case .needsAttention: return "exclamationmark.triangle.fill"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .unlocked: return .secondary
-        case .locked: return Color.pureQGreen
-        case .guarding: return Color.pureQAmber
-        case .needsAttention: return Color.pureQOrange
-        }
-    }
-}
-
-enum AudioSourceKind: String, CaseIterable, Identifiable, Codable {
-    case systemMix = "System Mix"
-    case application = "Application"
-    case game = "Game"
-    case browser = "Browser"
-
-    var id: String { rawValue }
-}
-
-struct AudioSourceItem: Identifiable, Equatable {
-    static let systemMixID = "source.system-mix"
-    static let gameSourceID = "source.games"
-
-    let id: String
-    let title: String
-    let bundleIdentifier: String?
-    var processIdentifier: pid_t?
-    let kind: AudioSourceKind
-    let systemImage: String
-    var isRunning: Bool
-
-    init(
-        id: String,
-        title: String,
-        bundleIdentifier: String?,
-        processIdentifier: pid_t? = nil,
-        kind: AudioSourceKind,
-        systemImage: String,
-        isRunning: Bool
-    ) {
-        self.id = id
-        self.title = title
-        self.bundleIdentifier = bundleIdentifier
-        self.processIdentifier = processIdentifier
-        self.kind = kind
-        self.systemImage = systemImage
-        self.isRunning = isRunning
-    }
-
-    var subtitle: String {
-        switch kind {
-        case .systemMix:
-            return "All macOS app audio"
-        case .application:
-            return isRunning ? "Running app" : "Application source"
-        case .game:
-            return isRunning ? "Running game/app" : "Game or custom app"
-        case .browser:
-            return isRunning ? "Running browser" : "Browser source"
-        }
-    }
-
-    static let systemMix = AudioSourceItem(
-        id: systemMixID,
-        title: "System Mix",
-        bundleIdentifier: nil,
-        kind: .systemMix,
-        systemImage: "macwindow.on.rectangle",
-        isRunning: true
-    )
-
-    static let commonSources: [AudioSourceItem] = [
-        AudioSourceItem(id: "com.apple.Music", title: "Apple Music", bundleIdentifier: "com.apple.Music", kind: .application, systemImage: "music.note", isRunning: false),
-        AudioSourceItem(id: "com.apple.Safari", title: "Safari", bundleIdentifier: "com.apple.Safari", kind: .browser, systemImage: "safari", isRunning: false),
-        AudioSourceItem(id: "com.google.Chrome", title: "Google Chrome", bundleIdentifier: "com.google.Chrome", kind: .browser, systemImage: "globe", isRunning: false),
-        AudioSourceItem(id: "com.spotify.client", title: "Spotify", bundleIdentifier: "com.spotify.client", kind: .application, systemImage: "music.quarternote.3", isRunning: false),
-        AudioSourceItem(id: "org.videolan.vlc", title: "VLC", bundleIdentifier: "org.videolan.vlc", kind: .application, systemImage: "play.rectangle", isRunning: false),
-        AudioSourceItem(id: gameSourceID, title: "Games", bundleIdentifier: nil, kind: .game, systemImage: "gamecontroller", isRunning: false)
-    ]
-}
-
-enum RoutingNodeKind: String, CaseIterable, Identifiable, Codable {
-    case source = "Source"
-    case bus = "Bus"
-    case equalizer = "EQ"
-    case guardNode = "Guard"
-    case output = "Output"
-    case monitor = "Monitor"
-
-    var id: String { rawValue }
-
-    var title: String { rawValue }
-
-    var systemImage: String {
-        switch self {
-        case .source: return "macwindow"
-        case .bus: return "switch.2"
-        case .equalizer: return "slider.horizontal.3"
-        case .guardNode: return "lock.shield"
-        case .output: return "speaker.wave.2.fill"
-        case .monitor: return "waveform"
-        }
-    }
-
-    var accent: Color {
-        switch self {
-        case .source: return .white.opacity(0.62)
-        case .bus, .equalizer: return Color.pureQGreen
-        case .guardNode: return Color.pureQAmber
-        case .output: return Color(red: 0.30, green: 0.70, blue: 0.90)
-        case .monitor: return Color(red: 0.86, green: 0.54, blue: 0.93)
-        }
-    }
-}
-
-enum TestReadinessState: Equatable {
-    case ready
-    case caution
-    case blocked
-
-    var title: String {
-        switch self {
-        case .ready: return "Ready"
-        case .caution: return "Check"
-        case .blocked: return "Blocked"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .ready: return "checkmark.circle.fill"
-        case .caution: return "exclamationmark.triangle.fill"
-        case .blocked: return "xmark.octagon.fill"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .ready: return Color.pureQGreen
-        case .caution: return Color.pureQAmber
-        case .blocked: return Color.pureQOrange
-        }
-    }
-}
-
-struct TestReadinessItem: Identifiable {
-    let id: String
-    let title: String
-    let detail: String
-    let state: TestReadinessState
-}
-
-struct RoutingNode: Identifiable, Equatable, Codable {
-    let id: UUID
-    var title: String
-    var subtitle: String
-    var kind: RoutingNodeKind
-    var position: CGPoint
-    var audioSourceID: String?
-    var audioOutputUID: String?
-    var isProtected: Bool
-    var eqMode: EqualizerMode
-    var eqSelection: EqualizerSelection
-    var eqPreamp: Double
-    var eqBalance: Double
-    var eqBands: [EqualizerBand]
-    var eqUsesMainEqualizer: Bool
-    var eqAutoGainEnabled: Bool
-    var eqManualMode: EqualizerMode
-    var eqManualPreamp: Double
-    var eqManualBalance: Double
-    var eqManualBands: [EqualizerBand]
-    var eqManualAutoGainEnabled: Bool
-
-    init(
-        id: UUID = UUID(),
-        title: String,
-        subtitle: String,
-        kind: RoutingNodeKind,
-        position: CGPoint,
-        audioSourceID: String? = nil,
-        audioOutputUID: String? = nil,
-        isProtected: Bool = false,
-        eqMode: EqualizerMode = .expert,
-        eqSelection: EqualizerSelection = .flat,
-        eqPreamp: Double = 0,
-        eqBalance: Double = 0,
-        eqBands: [EqualizerBand] = EqualizerBand.makeStandardBands(),
-        eqUsesMainEqualizer: Bool = false,
-        eqAutoGainEnabled: Bool = true,
-        eqManualMode: EqualizerMode? = nil,
-        eqManualPreamp: Double? = nil,
-        eqManualBalance: Double? = nil,
-        eqManualBands: [EqualizerBand]? = nil,
-        eqManualAutoGainEnabled: Bool? = nil
-    ) {
-        self.id = id
-        self.title = title
-        self.subtitle = subtitle
-        self.kind = kind
-        self.position = position
-        self.audioSourceID = audioSourceID
-        self.audioOutputUID = audioOutputUID
-        self.isProtected = isProtected
-        self.eqMode = eqMode
-        self.eqSelection = eqSelection
-        self.eqPreamp = eqPreamp
-        self.eqBalance = eqBalance
-        self.eqBands = eqBands
-        self.eqUsesMainEqualizer = eqUsesMainEqualizer
-        self.eqAutoGainEnabled = eqAutoGainEnabled
-        self.eqManualMode = eqManualMode ?? eqMode
-        self.eqManualPreamp = eqManualPreamp ?? eqPreamp
-        self.eqManualBalance = eqManualBalance ?? eqBalance
-        self.eqManualBands = eqManualBands ?? eqBands
-        self.eqManualAutoGainEnabled = eqManualAutoGainEnabled ?? eqAutoGainEnabled
-    }
-}
-
-struct RoutingConnection: Identifiable, Equatable, Codable {
-    let id: UUID
-    var from: RoutingNode.ID
-    var to: RoutingNode.ID
-
-    init(id: UUID = UUID(), from: RoutingNode.ID, to: RoutingNode.ID) {
-        self.id = id
-        self.from = from
-        self.to = to
-    }
-}
-
-struct EQProfileSnapshot: Equatable, Codable {
-    var title: String
-    var mode: EqualizerMode
-    var selection: EqualizerSelection
-    var preamp: Double
-    var balance: Double
-    var autoGainEnabled: Bool
-    var bands: [EqualizerBand]
-    var manualMode: EqualizerMode
-    var manualPreamp: Double
-    var manualBalance: Double
-    var manualBands: [EqualizerBand]
-    var manualAutoGainEnabled: Bool
-}
-
-struct EQProfileFile: Equatable, Codable {
-    static let currentSchemaVersion = 1
-
-    var schemaVersion: Int
-    var appName: String
-    var exportedAt: Date
-    var profile: EQProfileSnapshot
-
-    init(profile: EQProfileSnapshot) {
-        schemaVersion = Self.currentSchemaVersion
-        appName = "PureQ"
-        exportedAt = Date()
-        self.profile = profile
-    }
-}
-
-struct PureQSessionSnapshot: Equatable, Codable {
-    static let currentSchemaVersion = 1
-
-    var schemaVersion: Int
-    var savedAt: Date
-    var mainProfile: EQProfileSnapshot
-    var routingNodes: [RoutingNode]
-    var routingConnections: [RoutingConnection]
-    var activeEQNodeID: RoutingNode.ID?
-
-    init(
-        mainProfile: EQProfileSnapshot,
-        routingNodes: [RoutingNode],
-        routingConnections: [RoutingConnection],
-        activeEQNodeID: RoutingNode.ID?
-    ) {
-        schemaVersion = Self.currentSchemaVersion
-        savedAt = Date()
-        self.mainProfile = mainProfile
-        self.routingNodes = routingNodes
-        self.routingConnections = routingConnections
-        self.activeEQNodeID = activeEQNodeID
-    }
-
-    static func == (lhs: PureQSessionSnapshot, rhs: PureQSessionSnapshot) -> Bool {
-        lhs.schemaVersion == rhs.schemaVersion &&
-            lhs.mainProfile == rhs.mainProfile &&
-            lhs.routingNodes == rhs.routingNodes &&
-            lhs.routingConnections == rhs.routingConnections &&
-            lhs.activeEQNodeID == rhs.activeEQNodeID
-    }
-}
-
-enum EQProfileFileError: LocalizedError {
-    case unsupportedVersion(Int)
-    case emptyProfile
-
-    var errorDescription: String? {
-        switch self {
-        case .unsupportedVersion(let version):
-            return "This EQ file uses unsupported schema version \(version)."
-        case .emptyProfile:
-            return "This EQ file does not contain any bands."
-        }
-    }
-}
-
-private enum PureQPersistenceStore {
-    static let appSupportDirectoryURL = FileManager.default.urls(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask
-    )[0].appendingPathComponent("PureQ", isDirectory: true)
-    static let sessionSnapshotURL = appSupportDirectoryURL.appendingPathComponent("LastSession.pureqsession.json")
-
-    static func writeSessionSnapshot(_ snapshot: PureQSessionSnapshot) throws {
-        try FileManager.default.createDirectory(
-            at: appSupportDirectoryURL,
-            withIntermediateDirectories: true
-        )
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(snapshot)
-        try data.write(to: sessionSnapshotURL, options: .atomic)
-    }
-}
-
-@MainActor
-final class AudioTelemetryStore: ObservableObject {
-    @Published private(set) var telemetry: AudioEngineTelemetry = .empty
-
-    private var smoothedBandLevels = Array(repeating: 0.0, count: EqualizerBand.standardFrequencies.count)
-    private var smoothedSpectrumLevels: [Double] = []
-    private var meterIndexByRoundedFrequency: [Int: Int] = [:]
-    private var lastPublishTime = 0.0
-
-    func reset() {
-        smoothedBandLevels = Array(repeating: 0.0, count: EqualizerBand.standardFrequencies.count)
-        smoothedSpectrumLevels.removeAll(keepingCapacity: true)
-        meterIndexByRoundedFrequency.removeAll(keepingCapacity: true)
-        lastPublishTime = 0
-        telemetry = .empty
-    }
-
-    func publish(_ snapshot: AudioEngineTelemetry, smoothMeters: Bool) {
-        let levels = smoothedLevels(from: snapshot.bandLevels, smoothMeters: smoothMeters)
-        let spectrum = smoothedSpectrum(from: snapshot.spectrumLevels, smoothMeters: smoothMeters)
-        let next = AudioEngineTelemetry(
-            capturedFrames: snapshot.capturedFrames,
-            renderedFrames: snapshot.renderedFrames,
-            underrunFrames: snapshot.underrunFrames,
-            bufferedFrames: snapshot.bufferedFrames,
-            inputCallbacks: snapshot.inputCallbacks,
-            renderCallbacks: snapshot.renderCallbacks,
-            bandLevels: levels,
-            spectrumLevels: spectrum
-        )
-
-        guard shouldPublish(next) else { return }
-        telemetry = next
-    }
-
-    func bandActivityLevel(for frequency: Double) -> Double {
-        let cacheKey = Int(frequency.rounded())
-        let index: Int
-
-        if let cachedIndex = meterIndexByRoundedFrequency[cacheKey] {
-            index = cachedIndex
-        } else if let nearestIndex = EqualizerBand.standardFrequencies.indices.min(by: { lhs, rhs in
-            let lhsDistance = abs(log10(EqualizerBand.standardFrequencies[lhs]) - log10(frequency))
-            let rhsDistance = abs(log10(EqualizerBand.standardFrequencies[rhs]) - log10(frequency))
-            return lhsDistance < rhsDistance
-        }) {
-            meterIndexByRoundedFrequency[cacheKey] = nearestIndex
-            index = nearestIndex
-        } else {
-            return 0
-        }
-
-        guard telemetry.bandLevels.indices.contains(index) else {
-            return 0
-        }
-        return telemetry.bandLevels[index]
-    }
-
-    private func smoothedLevels(from rawLevels: [Double], smoothMeters: Bool) -> [Double] {
-        if smoothedBandLevels.count != rawLevels.count {
-            smoothedBandLevels = Array(repeating: 0.0, count: rawLevels.count)
-        }
-
-        guard smoothMeters else {
-            smoothedBandLevels = rawLevels
-            return rawLevels
-        }
-
-        for index in rawLevels.indices {
-            let current = smoothedBandLevels[index]
-            let target = rawLevels[index].clamped(to: 0...1)
-            let response = target > current ? 0.32 : 0.075
-            smoothedBandLevels[index] = current + ((target - current) * response)
-        }
-        return smoothedBandLevels
-    }
-
-    private func smoothedSpectrum(from rawLevels: [Double], smoothMeters: Bool) -> [Double] {
-        guard !rawLevels.isEmpty else {
-            smoothedSpectrumLevels.removeAll(keepingCapacity: true)
-            return []
-        }
-
-        if smoothedSpectrumLevels.count != rawLevels.count {
-            smoothedSpectrumLevels = Array(repeating: 0.0, count: rawLevels.count)
-        }
-
-        guard smoothMeters else {
-            smoothedSpectrumLevels = rawLevels
-            return rawLevels
-        }
-
-        for index in rawLevels.indices {
-            let current = smoothedSpectrumLevels[index]
-            let target = rawLevels[index].clamped(to: 0...1)
-            let response = target > current ? 0.28 : 0.085
-            smoothedSpectrumLevels[index] = current + ((target - current) * response)
-        }
-        return smoothedSpectrumLevels
-    }
-
-    private func shouldPublish(_ next: AudioEngineTelemetry) -> Bool {
-        let levelsChanged = bandLevelsChangedSignificantly(next.bandLevels)
-        let spectrumChanged = spectrumLevelsChangedSignificantly(next.spectrumLevels)
-        let countersChanged = telemetry.capturedFrames != next.capturedFrames ||
-            telemetry.renderedFrames != next.renderedFrames ||
-            telemetry.underrunFrames != next.underrunFrames ||
-            telemetry.bufferedFrames != next.bufferedFrames ||
-            telemetry.inputCallbacks != next.inputCallbacks ||
-            telemetry.renderCallbacks != next.renderCallbacks
-
-        guard levelsChanged || spectrumChanged || countersChanged else { return false }
-
-        let now = Date.timeIntervalSinceReferenceDate
-        if levelsChanged || spectrumChanged || now - lastPublishTime >= 0.25 {
-            lastPublishTime = now
-            return true
-        }
-        return false
-    }
-
-    private func bandLevelsChangedSignificantly(_ nextLevels: [Double]) -> Bool {
-        guard telemetry.bandLevels.count == nextLevels.count else { return true }
-        return zip(telemetry.bandLevels, nextLevels).contains { oldValue, newValue in
-            abs(oldValue - newValue) > 0.008
-        }
-    }
-
-    private func spectrumLevelsChangedSignificantly(_ nextLevels: [Double]) -> Bool {
-        guard telemetry.spectrumLevels.count == nextLevels.count else { return true }
-        return zip(telemetry.spectrumLevels, nextLevels).contains { oldValue, newValue in
-            abs(oldValue - newValue) > 0.012
-        }
-    }
-}
-
-@MainActor
 final class EqualizerModel: ObservableObject {
     let telemetryStore = AudioTelemetryStore()
+
+    private static let graphWidthScaleKey = "PureQ.GraphWidthScale"
+    private static let graphHeightScaleKey = "PureQ.GraphHeightScale"
+    private static let graphScaleRange = 0.75...1.65
 
     @Published var powerEnabled = true {
         didSet {
@@ -696,18 +26,39 @@ final class EqualizerModel: ObservableObject {
     @Published var preamp: Double = 0
     @Published var balance: Double = 0
     @Published var autoGainEnabled = true
-    @Published var highFrameRateUIEnabled = false {
+    @Published var highFrameRateUIEnabled = true {
         didSet {
             if audioEngineRunState == .running {
                 startEngineTelemetryPolling()
+                updateAudioEngineRendering(scheduleSave: false)
             }
         }
     }
     @Published var spectrumAnalyzerEnabled = false {
         didSet {
+            if audioEngineRunState == .running {
+                startEngineTelemetryPolling()
+            }
             updateAudioEngineRendering(scheduleSave: false)
+            if !spectrumAnalyzerEnabled && !soundIndicatorsEnabled {
+                telemetryStore.reset()
+            }
         }
     }
+    @Published var soundIndicatorsEnabled = false {
+        didSet {
+            if audioEngineRunState == .running {
+                startEngineTelemetryPolling()
+                updateAudioEngineRendering(scheduleSave: false)
+            }
+            if !soundIndicatorsEnabled {
+                telemetryStore.reset()
+            }
+        }
+    }
+    @Published var graphBandEditingEnabled = false
+    @Published private(set) var graphWidthScale = EqualizerModel.persistedGraphScale(forKey: graphWidthScaleKey)
+    @Published private(set) var graphHeightScale = EqualizerModel.persistedGraphScale(forKey: graphHeightScaleKey)
     @Published var autoStartEngineEnabled = true {
         didSet {
             if autoStartEngineEnabled {
@@ -719,52 +70,12 @@ final class EqualizerModel: ObservableObject {
             }
         }
     }
-    @Published var processedTakeoverEnabled = false {
-        didSet {
-            restartAudioEngineIfNeeded()
-        }
-    }
     @Published private(set) var bands = EqualizerBand.makeStandardBands()
 
     @Published private(set) var outputDevices: [AudioOutputDevice] = []
     @Published private(set) var defaultOutputUID: String?
     @Published private(set) var defaultSystemOutputUID: String?
     @Published private(set) var availableAudioSources: [AudioSourceItem] = [AudioSourceItem.systemMix] + AudioSourceItem.commonSources
-    @Published var selectedOutputUID: String? {
-        didSet {
-            if let selectedOutputUID,
-               let device = outputDevices.first(where: { $0.uid == selectedOutputUID }) {
-                setSelectedOutputNameIfNeeded(device.name)
-            }
-            applySelectedOutputAsSystemDefaultIfNeeded()
-            if outputLockEnabled {
-                enforceOutputLock()
-            } else if lockStatus != .needsAttention {
-                lockStatus = .unlocked
-                lockMessage = "Output lock is off."
-            }
-            syncRoutingOutputNodes()
-            restartAudioEngineIfNeeded()
-        }
-    }
-    @Published var outputLockEnabled = false {
-        didSet {
-            if outputLockEnabled {
-                enforceOutputLock()
-                syncRoutingOutputNodes()
-            } else {
-                releaseSuppressedOutputs()
-                restoreSystemDefaultToRenderOutput()
-                lockStatus = .unlocked
-                lockMessage = "Output lock is off."
-                syncRoutingOutputNodes()
-            }
-            restartAudioEngineIfNeeded()
-        }
-    }
-    @Published private(set) var lockStatus: OutputLockStatus = .unlocked
-    @Published private(set) var lockMessage = "Output lock is off."
-    @Published private(set) var selectedOutputName = "No output selected"
     @Published var routingNodes: [RoutingNode] = []
     @Published var routingConnections: [RoutingConnection] = []
     @Published var selectedRoutingNodeID: RoutingNode.ID?
@@ -772,7 +83,13 @@ final class EqualizerModel: ObservableObject {
     @Published var patchStartNodeID: RoutingNode.ID?
     @Published private(set) var eqFileMessage: String?
     @Published private(set) var audioEngineRunState: AudioEngineRunState = .stopped
+    @Published private(set) var driverInstallInProgress = false
+    @Published private(set) var driverInstallMessage: String?
+    @Published private(set) var canUndoActiveScope = false
     private(set) var audioEngineTelemetry: AudioEngineTelemetry = .empty
+    @Published private(set) var audioEngineSampleRate: Double = 48_000
+    @Published private(set) var pureQSystemVolume: Float = 1
+    @Published private(set) var pureQSystemMuted = false
 
     private let audioService = AudioOutputService()
     private let audioEngine = AudioEngineService()
@@ -786,11 +103,18 @@ final class EqualizerModel: ObservableObject {
     private var lastQueuedSessionSnapshot: PureQSessionSnapshot?
     private var lastWrittenSessionSnapshot: PureQSessionSnapshot?
     private var isRestoringPersistentState = false
+    private var isApplyingUndoSnapshot = false
+    private var activeUndoScope: PureQUndoScope? = .equalizer
+    private var equalizerUndoStack: [PureQSessionSnapshot] = []
+    private var routingUndoStack: [PureQSessionSnapshot] = []
+    private var equalizerContinuousUndoTokens = Set<String>()
+    private var equalizerContinuousUndoResetWorkItems: [String: DispatchWorkItem] = [:]
     private var lastAutoStartFailureSignature: String?
     private var isStartingAudioEngine = false
     private var manualStopSuppressesAutoStart = false
-    private var suppressedOutputUIDs = Set<String>()
-    private var isApplyingSelectedOutputDefault = false
+    private var preVirtualDefaultOutputUID: String?
+    private var normalizedHardwareOutputVolumeStates: [String: AudioOutputVolumeState] = [:]
+    private var observedPureQVolumeDeviceID: AudioDeviceID?
     private var manualMode: EqualizerMode = .expert
     private var manualPreamp: Double = 0
     private var manualBalance: Double = 0
@@ -811,7 +135,8 @@ final class EqualizerModel: ObservableObject {
     }
 
     func bandActivityLevel(for frequency: Double) -> Double {
-        telemetryStore.bandActivityLevel(for: frequency)
+        guard soundIndicatorsEnabled else { return 0 }
+        return telemetryStore.bandActivityLevel(for: frequency)
     }
 
     var eqRoutingNodes: [RoutingNode] {
@@ -891,22 +216,24 @@ final class EqualizerModel: ObservableObject {
         outputDevices.first(where: \.isPureQVirtualOutput)
     }
 
-    var selectedOutput: AudioOutputDevice? {
-        guard let selectedOutputUID else { return nil }
-        return hardwareOutputDevices.first(where: { $0.uid == selectedOutputUID })
-    }
-
     var defaultOutputName: String {
         outputDevices.first(where: { $0.uid == defaultOutputUID })?.name ?? "Unknown output"
     }
 
+    var routingRenderOutputSummary: String {
+        let routedUIDs = routedHardwareOutputUIDs()
+        let outputNames = hardwareOutputDevices
+            .filter { routedUIDs.contains($0.uid) }
+            .map(\.name)
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+
+        if outputNames.isEmpty {
+            return "Silent until an output node is connected"
+        }
+        return outputNames.joined(separator: ", ")
+    }
+
     var menuBarSystemImage: String {
-        if outputLockEnabled && lockStatus == .guarding {
-            return "speaker.slash.fill"
-        }
-        if outputLockEnabled {
-            return "lock.fill"
-        }
         return powerEnabled ? "slider.horizontal.3" : "power"
     }
 
@@ -915,8 +242,6 @@ final class EqualizerModel: ObservableObject {
             sourceReadiness,
             engineReadiness,
             outputDeviceReadiness,
-            selectedOutputReadiness,
-            outputLockReadiness,
             routingGraphReadiness,
             routingLayoutReadiness,
             driverReadiness
@@ -934,7 +259,6 @@ final class EqualizerModel: ObservableObject {
     }
 
     var audioEngineConfiguration: AudioEngineConfiguration {
-        let renderOutput = renderOutputDevice
         let virtualCapture = virtualCaptureDeviceForEngine
         return audioEngine.makeConfiguration(
             enabled: powerEnabled,
@@ -944,12 +268,16 @@ final class EqualizerModel: ObservableObject {
             sources: availableAudioSources,
             nodes: routingNodes,
             connections: routingConnections,
-            outputUID: renderOutput?.uid,
-            outputName: renderOutput?.name ?? selectedOutputName,
+            outputUID: nil,
+            outputName: "Unrouted",
             virtualCaptureUID: virtualCapture?.uid,
             virtualCaptureName: virtualCapture?.name,
             spectrumAnalyzerEnabled: spectrumAnalyzerEnabled && !visibleGraphicalSurfaceIDs.isEmpty,
-            processedTakeoverEnabled: audioEngineTakeoverActive
+            bandMetersEnabled: soundIndicatorsEnabled && !visibleGraphicalSurfaceIDs.isEmpty,
+            visualAnalyzerFrameRate: visualAnalyzerFrameRate,
+            systemVolume: pureQSystemVolume,
+            systemMuted: pureQSystemMuted,
+            processedTakeoverEnabled: true
         )
     }
 
@@ -960,21 +288,11 @@ final class EqualizerModel: ObservableObject {
     var canStartAudioEngine: Bool {
         let configuration = audioEngineConfiguration
         return audioEngineStatus.state != .blocked &&
-            !configuration.renderTargets.isEmpty &&
             resolvedOutputDeviceIDs(for: configuration).count == configuration.renderTargets.count
     }
 
     var audioEngineTakeoverActive: Bool {
-        if outputLockEnabled {
-            return audioEngine.processTapsAvailable
-        }
-
-        if processedTakeoverEnabled {
-            return true
-        }
-
-        let routedOutputUIDs = routedHardwareOutputUIDs()
-        return activeOutputDefaultUIDs.contains { routedOutputUIDs.contains($0) }
+        audioEngine.processTapsAvailable || pureQVirtualOutputDevice != nil
     }
 
     init() {
@@ -989,12 +307,89 @@ final class EqualizerModel: ObservableObject {
     }
 
     deinit {
+        restoreNormalizedHardwareOutputVolumes()
         pollTimer?.invalidate()
         engineTelemetryTimer?.invalidate()
         autoStartWorkItem?.cancel()
         persistenceWorkItem?.cancel()
+        equalizerContinuousUndoResetWorkItems.values.forEach { $0.cancel() }
+        if let observedPureQVolumeDeviceID {
+            let audioService = audioService
+            Task { @MainActor in
+                audioService.stopObservingVolumeChanges(deviceID: observedPureQVolumeDeviceID)
+            }
+        }
         for (center, observer) in lifecycleObservers {
             center.removeObserver(observer)
+        }
+    }
+
+    func setActiveUndoScope(_ scope: PureQUndoScope?) {
+        activeUndoScope = scope
+        updateUndoAvailability()
+    }
+
+    func setGraphWidthScale(_ scale: Double) {
+        setGraphScale(scale, key: Self.graphWidthScaleKey) { graphWidthScale = $0 }
+    }
+
+    func setGraphHeightScale(_ scale: Double) {
+        setGraphScale(scale, key: Self.graphHeightScaleKey) { graphHeightScale = $0 }
+    }
+
+    func resetGraphScale() {
+        setGraphWidthScale(1)
+        setGraphHeightScale(1)
+    }
+
+    private static func persistedGraphScale(forKey key: String) -> Double {
+        let value = UserDefaults.standard.object(forKey: key) as? Double ?? 1
+        return value.clamped(to: graphScaleRange)
+    }
+
+    private func setGraphScale(_ scale: Double, key: String, assign: (Double) -> Void) {
+        let clampedScale = scale.clamped(to: Self.graphScaleRange)
+        let currentScale = UserDefaults.standard.object(forKey: key) as? Double ?? 1
+        guard abs(currentScale - clampedScale) > 0.000_1 else { return }
+        assign(clampedScale)
+        UserDefaults.standard.set(clampedScale, forKey: key)
+    }
+
+    func undoActiveScope() {
+        guard let activeUndoScope else { return }
+        undo(scope: activeUndoScope)
+    }
+
+    func undo(scope: PureQUndoScope) {
+        guard let snapshot = popUndoSnapshot(for: scope) else {
+            updateUndoAvailability()
+            return
+        }
+
+        isApplyingUndoSnapshot = true
+        defer {
+            isApplyingUndoSnapshot = false
+            updateUndoAvailability()
+        }
+
+        do {
+            equalizerContinuousUndoTokens.removeAll()
+            equalizerContinuousUndoResetWorkItems.values.forEach { $0.cancel() }
+            equalizerContinuousUndoResetWorkItems.removeAll()
+            try applyPersistedSession(snapshot)
+            lastQueuedSessionSnapshot = makeSessionSnapshot()
+            lastWrittenSessionSnapshot = nil
+            switch scope {
+            case .equalizer:
+                syncLinkedEQNodes()
+                syncRoutingOutputNodes()
+                updateAudioEngineRendering()
+            case .routing:
+                restartAudioEngineIfNeeded()
+                schedulePersistedStateSave()
+            }
+        } catch {
+            eqFileMessage = "Could not undo: \(error.localizedDescription)"
         }
     }
 
@@ -1030,6 +425,33 @@ final class EqualizerModel: ObservableObject {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+
+        if url.pathExtension.lowercased() == "eqpreset" {
+            do {
+                try importEqualiserPreset(data: data, decoder: decoder)
+                return
+            } catch let externalError {
+                do {
+                    try importPureQProfile(data: data, decoder: decoder)
+                    return
+                } catch {
+                    throw externalError
+                }
+            }
+        }
+
+        do {
+            try importPureQProfile(data: data, decoder: decoder)
+        } catch let pureQError {
+            do {
+                try importEqualiserPreset(data: data, decoder: decoder)
+            } catch {
+                throw pureQError
+            }
+        }
+    }
+
+    private func importPureQProfile(data: Data, decoder: JSONDecoder) throws {
         let file = try decoder.decode(EQProfileFile.self, from: data)
         guard file.schemaVersion <= EQProfileFile.currentSchemaVersion else {
             throw EQProfileFileError.unsupportedVersion(file.schemaVersion)
@@ -1037,6 +459,13 @@ final class EqualizerModel: ObservableObject {
         let profile = try sanitizedProfile(file.profile)
         applyProfileToActiveEQ(profile)
         eqFileMessage = "Imported \(profile.title)."
+    }
+
+    private func importEqualiserPreset(data: Data, decoder: JSONDecoder) throws {
+        let result = try EqualiserPresetImporter.importProfile(from: data, decoder: decoder)
+        let profile = try sanitizedProfile(result.profile)
+        applyProfileToActiveEQ(profile)
+        eqFileMessage = result.statusMessage
     }
 
     func flushPersistedState() {
@@ -1168,6 +597,79 @@ final class EqualizerModel: ObservableObject {
         )
     }
 
+    private func rememberUndo(_ scope: PureQUndoScope) {
+        guard !isRestoringPersistentState, !isApplyingUndoSnapshot else { return }
+        let snapshot = makeSessionSnapshot()
+        switch scope {
+        case .equalizer:
+            guard equalizerUndoStack.last != snapshot else { return }
+            equalizerUndoStack.append(snapshot)
+            if equalizerUndoStack.count > 80 {
+                equalizerUndoStack.removeFirst(equalizerUndoStack.count - 80)
+            }
+        case .routing:
+            guard routingUndoStack.last != snapshot else { return }
+            routingUndoStack.append(snapshot)
+            if routingUndoStack.count > 80 {
+                routingUndoStack.removeFirst(routingUndoStack.count - 80)
+            }
+        }
+        updateUndoAvailability()
+    }
+
+    private func rememberEqualizerUndo(persist: Bool = true, continuousToken: String? = nil) {
+        guard persist else {
+            guard let continuousToken else { return }
+            if equalizerContinuousUndoTokens.insert(continuousToken).inserted {
+                rememberUndo(.equalizer)
+            }
+            scheduleEqualizerContinuousUndoReset(for: continuousToken)
+            return
+        }
+
+        if let continuousToken,
+           equalizerContinuousUndoTokens.remove(continuousToken) != nil {
+            equalizerContinuousUndoResetWorkItems[continuousToken]?.cancel()
+            equalizerContinuousUndoResetWorkItems[continuousToken] = nil
+            return
+        }
+        rememberUndo(.equalizer)
+    }
+
+    private func scheduleEqualizerContinuousUndoReset(for token: String) {
+        equalizerContinuousUndoResetWorkItems[token]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.equalizerContinuousUndoTokens.remove(token)
+                self?.equalizerContinuousUndoResetWorkItems[token] = nil
+            }
+        }
+        equalizerContinuousUndoResetWorkItems[token] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: workItem)
+    }
+
+    private func popUndoSnapshot(for scope: PureQUndoScope) -> PureQSessionSnapshot? {
+        switch scope {
+        case .equalizer:
+            return equalizerUndoStack.popLast()
+        case .routing:
+            return routingUndoStack.popLast()
+        }
+    }
+
+    private func updateUndoAvailability() {
+        guard let activeUndoScope else {
+            canUndoActiveScope = false
+            return
+        }
+        switch activeUndoScope {
+        case .equalizer:
+            canUndoActiveScope = !equalizerUndoStack.isEmpty
+        case .routing:
+            canUndoActiveScope = !routingUndoStack.isEmpty
+        }
+    }
+
     private func activeEQProfileSnapshot() -> EQProfileSnapshot {
         if let activeEQNode {
             return profileSnapshot(from: activeEQNode)
@@ -1210,6 +712,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     private func applyProfileToActiveEQ(_ profile: EQProfileSnapshot) {
+        rememberUndo(.equalizer)
         if let nodeID = activeEQNode?.id {
             updateEQNode(id: nodeID) { node in
                 node.eqUsesMainEqualizer = false
@@ -1303,6 +806,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setMode(_ newMode: EqualizerMode) {
+        rememberUndo(.equalizer)
         bands = retargetedBands(for: newMode.frequencies, from: bands)
         mode = newMode
         applyAutoGainIfNeeded()
@@ -1313,6 +817,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setBandLayout(_ layout: EqualizerBandLayout) {
+        rememberUndo(.equalizer)
         let currentLayout = bandLayout(for: mode, bands: bands)
         switch layout {
         case .bands10:
@@ -1342,6 +847,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func applySelection(_ newSelection: EqualizerSelection) {
+        rememberUndo(.equalizer)
         if newSelection == .manual {
             restoreMainManualProfile()
             syncLinkedEQNodes()
@@ -1395,6 +901,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setPreamp(_ value: Double) {
+        rememberEqualizerUndo(persist: false, continuousToken: "main-preamp")
         preamp = value.clamped(to: -20...20)
         selection = .manual
         saveMainManualProfile()
@@ -1403,6 +910,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setBalance(_ value: Double) {
+        rememberEqualizerUndo(persist: false, continuousToken: "main-balance")
         balance = value.clamped(to: -1...1)
         selection = .manual
         saveMainManualProfile()
@@ -1411,6 +919,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setAutoGain(_ enabled: Bool) {
+        rememberUndo(.equalizer)
         autoGainEnabled = enabled
         applyAutoGainIfNeeded()
         selection = .manual
@@ -1420,17 +929,21 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setBandGain(id: EqualizerBand.ID, gain: Double, persist: Bool = true) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "band-gain-\(id.uuidString)")
         updateBand(id: id) { band in
             band.gain = gain.clamped(to: -20...20)
         }
         selection = .manual
-        applyAutoGainIfNeeded()
-        saveMainManualProfile()
+        if persist {
+            applyAutoGainIfNeeded()
+            saveMainManualProfile()
+        }
         syncLinkedEQNodes()
         updateAudioEngineRendering(scheduleSave: persist)
     }
 
     func setBandFrequency(id: EqualizerBand.ID, frequency: Double) {
+        rememberUndo(.equalizer)
         updateBand(id: id) { band in
             band.frequency = frequency.clamped(to: 20...20_000)
         }
@@ -1441,17 +954,40 @@ final class EqualizerModel: ObservableObject {
         updateAudioEngineRendering()
     }
 
+    func setBandGraphPosition(id: EqualizerBand.ID, frequency: Double, gain: Double, persist: Bool = true) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "band-graph-\(id.uuidString)")
+        updateBand(id: id) { band in
+            guard band.isEnabled else { return }
+            band.frequency = frequency.clamped(to: 20...20_000)
+            band.gain = gain.clamped(to: -20...20)
+        }
+        if persist {
+            sortBands(&bands)
+        }
+        selection = .manual
+        if persist {
+            applyAutoGainIfNeeded()
+            saveMainManualProfile()
+        }
+        syncLinkedEQNodes()
+        updateAudioEngineRendering(scheduleSave: persist)
+    }
+
     func setBandQ(id: EqualizerBand.ID, q: Double, persist: Bool = true) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "band-q-\(id.uuidString)")
         updateBand(id: id) { band in
             band.q = q.clamped(to: 0.1...10)
         }
         selection = .manual
-        saveMainManualProfile()
+        if persist {
+            saveMainManualProfile()
+        }
         syncLinkedEQNodes()
         updateAudioEngineRendering(scheduleSave: persist)
     }
 
     func addBand() {
+        rememberUndo(.equalizer)
         let frequency = suggestedCustomBandFrequency(in: bands)
         bands.append(EqualizerBand(frequency: frequency, gain: 0, q: 0.5, isCustom: true))
         sortBands(&bands)
@@ -1462,6 +998,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func toggleBand(id: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateBand(id: id) { band in
             band.isEnabled.toggle()
         }
@@ -1473,6 +1010,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func toggleStereoLink(id: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateBand(id: id) { band in
             band.isStereoLinked.toggle()
         }
@@ -1483,6 +1021,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func cycleShape(id: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateBand(id: id) { band in
             switch band.shape {
             case .bell:
@@ -1573,6 +1112,7 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        rememberUndo(.equalizer)
         routingNodes[index].eqUsesMainEqualizer = false
         routingNodes[index].eqMode = mode
         routingNodes[index].eqSelection = selection
@@ -1602,6 +1142,14 @@ final class EqualizerModel: ObservableObject {
             setEQNodeBandFrequency(nodeID: nodeID, bandID: id, frequency: frequency)
         } else {
             setBandFrequency(id: id, frequency: frequency)
+        }
+    }
+
+    func setActiveEQBandGraphPosition(id: EqualizerBand.ID, frequency: Double, gain: Double, persist: Bool = true) {
+        if let nodeID = activeEQNode?.id {
+            setEQNodeBandGraphPosition(nodeID: nodeID, bandID: id, frequency: frequency, gain: gain, persist: persist)
+        } else {
+            setBandGraphPosition(id: id, frequency: frequency, gain: gain, persist: persist)
         }
     }
 
@@ -1643,10 +1191,6 @@ final class EqualizerModel: ObservableObject {
         } else {
             cycleShape(id: id)
         }
-    }
-
-    func setProcessedTakeover(_ enabled: Bool) {
-        processedTakeoverEnabled = enabled
     }
 
     func refreshAudioSources() {
@@ -1710,36 +1254,99 @@ final class EqualizerModel: ObservableObject {
             defaultSystemOutputUID = snapshot.defaultSystemOutputUID
         }
 
-        if let selectedOutputUID,
-           let device = hardwareOutputDevices.first(where: { $0.uid == selectedOutputUID }) {
-            setSelectedOutputNameIfNeeded(device.name)
-        } else if let selectedOutputUID,
-                  outputDevices.first(where: { $0.uid == selectedOutputUID })?.isPureQVirtualOutput == true {
-            setSelectedOutputUIDIfNeeded(preferredHardwareOutputDevice?.uid)
-            setSelectedOutputNameIfNeeded(preferredHardwareOutputDevice?.name ?? "No hardware output selected")
-        } else if !outputLockEnabled {
-            setSelectedOutputUIDIfNeeded(preferredHardwareOutputDevice?.uid)
-            if let selectedOutputUID = self.selectedOutputUID,
-               let device = hardwareOutputDevices.first(where: { $0.uid == selectedOutputUID }) {
-                setSelectedOutputNameIfNeeded(device.name)
-            } else {
-                setSelectedOutputNameIfNeeded("No hardware output selected")
-            }
-        }
-
-        if !outputLockEnabled && outputDefaultsIncludePureQVirtualOutput {
-            restoreSystemDefaultToRenderOutput()
-            return
-        }
-
-        if enforceLock {
-            enforceOutputLock()
-        }
         syncRoutingOutputNodes()
+        updatePureQVolumeBridge()
         if previousTakeoverActive != audioEngineTakeoverActive {
             restartAudioEngineIfNeeded()
         } else {
             scheduleAutoStartIfNeeded()
+        }
+    }
+
+    private func updatePureQVolumeBridge() {
+        guard let virtualOutput = pureQVirtualOutputDevice else {
+            if let observedPureQVolumeDeviceID {
+                audioService.stopObservingVolumeChanges(deviceID: observedPureQVolumeDeviceID)
+                self.observedPureQVolumeDeviceID = nil
+            }
+            pureQSystemVolume = 1
+            pureQSystemMuted = false
+            return
+        }
+
+        refreshPureQSystemVolume(from: virtualOutput)
+        if observedPureQVolumeDeviceID != virtualOutput.audioObjectID {
+            if let observedPureQVolumeDeviceID {
+                audioService.stopObservingVolumeChanges(deviceID: observedPureQVolumeDeviceID)
+            }
+            observedPureQVolumeDeviceID = virtualOutput.audioObjectID
+            audioService.observeVolumeChanges(deviceID: virtualOutput.audioObjectID) { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshPureQSystemVolumeAndApply()
+                }
+            }
+        }
+    }
+
+    private func refreshPureQSystemVolumeAndApply() {
+        guard let virtualOutput = pureQVirtualOutputDevice else { return }
+        let changed = refreshPureQSystemVolume(from: virtualOutput)
+        if changed {
+            updateAudioEngineRendering(scheduleSave: false)
+        }
+    }
+
+    @discardableResult
+    private func refreshPureQSystemVolume(from virtualOutput: AudioOutputDevice) -> Bool {
+        let nextVolume = audioService.outputGain(uid: virtualOutput.uid) ?? 1
+        let nextMuted = audioService.muted(uid: virtualOutput.uid)
+        let changed = abs(pureQSystemVolume - nextVolume) > 0.001 || pureQSystemMuted != nextMuted
+        pureQSystemVolume = nextVolume
+        pureQSystemMuted = nextMuted
+        return changed
+    }
+
+    func installBundledAudioDriver() {
+        guard !driverInstallInProgress else { return }
+        guard let driverURL = Bundle.main.url(forResource: "PureQ", withExtension: "driver") else {
+            driverInstallMessage = "PureQ.driver is not bundled in this app build."
+            return
+        }
+
+        driverInstallInProgress = true
+        driverInstallMessage = audioEngineStatus.driverInstalled ? "Repairing PureQ audio driver..." : "Installing PureQ audio driver..."
+        let sourcePath = driverURL.path
+        let shouldResumeEngine = audioEngineRunState == .running
+        if shouldResumeEngine {
+            stopAudioEngine(manual: false)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [sourcePath, shouldResumeEngine] in
+            let result = Result {
+                try Self.runPrivilegedShellCommand(Self.driverInstallCommand(sourcePath: sourcePath))
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.finishDriverInstall(result: result, shouldResumeEngine: shouldResumeEngine)
+            }
+        }
+    }
+
+    func uninstallAudioDriver() {
+        guard !driverInstallInProgress else { return }
+        driverInstallInProgress = true
+        driverInstallMessage = "Removing PureQ audio driver..."
+        let shouldResumeEngine = audioEngineRunState == .running
+        if shouldResumeEngine {
+            stopAudioEngine(manual: false)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [shouldResumeEngine] in
+            let result = Result {
+                try Self.runPrivilegedShellCommand(Self.driverUninstallCommand())
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.finishDriverUninstall(result: result, shouldResumeEngine: shouldResumeEngine)
+            }
         }
     }
 
@@ -1755,26 +1362,39 @@ final class EqualizerModel: ObservableObject {
         }
 
         refreshAudioSources()
-        refreshAudioDevices(enforceLock: outputLockEnabled)
+        refreshAudioDevices(enforceLock: false)
         selectDefaultEQNodeIfNeeded()
 
-        let virtualCapture = virtualCaptureDeviceForEngine
-        let switchedDefaultToVirtual = virtualCapture != nil ? switchSystemDefaultToVirtualOutputForEngine() : false
         let configuration = audioEngineConfiguration
+        let virtualCapture = virtualCaptureDeviceForEngine
+        let shouldDeferVirtualSwitch = virtualCapture != nil && configuration.prefersDriverCapture
+        var switchedDefaultToVirtual = false
+        var didStartRendering = false
         let outputDeviceIDs = resolvedOutputDeviceIDs(for: configuration)
         do {
+            if virtualCapture != nil && !shouldDeferVirtualSwitch {
+                switchedDefaultToVirtual = try ensureSystemDefaultForVirtualCapture()
+            }
             try audioEngine.startRendering(
                 configuration: configuration,
                 outputDeviceIDsByUID: outputDeviceIDs,
                 captureDeviceID: virtualCapture?.audioObjectID
             )
+            didStartRendering = true
+            if shouldDeferVirtualSwitch {
+                switchedDefaultToVirtual = try ensureSystemDefaultForVirtualCapture()
+            }
+            normalizeRoutedHardwareOutputVolumes(for: configuration)
             lastAutoStartFailureSignature = nil
             setAudioEngineRunState(audioEngine.runState)
             refreshAudioEngineTelemetry()
             startEngineTelemetryPolling()
         } catch {
+            if didStartRendering {
+                audioEngine.stopRendering()
+            }
             if switchedDefaultToVirtual {
-                restoreSystemDefaultToRenderOutput()
+                restoreSystemDefaultAfterVirtualCapture()
             }
             setAudioEngineRunState(.failed(error.localizedDescription))
             if !manual {
@@ -1792,11 +1412,12 @@ final class EqualizerModel: ObservableObject {
             autoStartWorkItem = nil
         }
         audioEngine.stopRendering()
+        restoreNormalizedHardwareOutputVolumes()
         setAudioEngineRunState(audioEngine.runState)
         stopEngineTelemetryPolling()
         refreshAudioEngineTelemetry()
-        if !outputLockEnabled {
-            restoreSystemDefaultToRenderOutput()
+        if manual {
+            restoreSystemDefaultAfterVirtualCapture()
         }
     }
 
@@ -1809,7 +1430,9 @@ final class EqualizerModel: ObservableObject {
             scheduleAutoStartIfNeeded()
             return
         }
-        audioEngine.updateRendering(configuration: audioEngineConfiguration)
+        let configuration = audioEngineConfiguration
+        audioEngine.updateRendering(configuration: configuration)
+        normalizeRoutedHardwareOutputVolumes(for: configuration)
         setAudioEngineRunState(audioEngine.runState)
         refreshAudioEngineTelemetry()
     }
@@ -1819,14 +1442,88 @@ final class EqualizerModel: ObservableObject {
         audioEngineRunState = newValue
     }
 
-    private func setSelectedOutputUIDIfNeeded(_ newValue: String?) {
-        guard selectedOutputUID != newValue else { return }
-        selectedOutputUID = newValue
+    private func finishDriverInstall(result: Result<Void, Error>, shouldResumeEngine: Bool) {
+        driverInstallInProgress = false
+        switch result {
+        case .success:
+            driverInstallMessage = "PureQ audio driver installed. CoreAudio was restarted."
+            refreshAudioDevices(enforceLock: false)
+            if shouldResumeEngine {
+                startAudioEngine(manual: false)
+            } else {
+                scheduleAutoStartIfNeeded()
+            }
+        case .failure(let error):
+            driverInstallMessage = "Driver install failed: \(error.localizedDescription)"
+            refreshAudioDevices(enforceLock: false)
+        }
     }
 
-    private func setSelectedOutputNameIfNeeded(_ newValue: String) {
-        guard selectedOutputName != newValue else { return }
-        selectedOutputName = newValue
+    private func finishDriverUninstall(result: Result<Void, Error>, shouldResumeEngine: Bool) {
+        driverInstallInProgress = false
+        switch result {
+        case .success:
+            driverInstallMessage = "PureQ audio driver removed. CoreAudio was restarted."
+            refreshAudioDevices(enforceLock: false)
+        case .failure(let error):
+            driverInstallMessage = "Driver uninstall failed: \(error.localizedDescription)"
+            refreshAudioDevices(enforceLock: false)
+            if shouldResumeEngine {
+                startAudioEngine(manual: false)
+            }
+        }
+    }
+
+    nonisolated private static func driverInstallCommand(sourcePath: String) -> String {
+        let source = shellQuoted(sourcePath)
+        let destination = shellQuoted("/Library/Audio/Plug-Ins/HAL/PureQ.driver")
+        let destinationDirectory = shellQuoted("/Library/Audio/Plug-Ins/HAL")
+        return [
+            "/bin/mkdir -p \(destinationDirectory)",
+            "/bin/rm -rf \(destination)",
+            "/usr/bin/ditto --norsrc --noextattr \(source) \(destination)",
+            "/usr/sbin/chown -R root:wheel \(destination)",
+            "/bin/chmod -R go-w \(destination)",
+            "(/usr/bin/xattr -cr \(destination) >/dev/null 2>&1 || true)",
+            "(/usr/bin/killall coreaudiod >/dev/null 2>&1 || true)"
+        ].joined(separator: " && ")
+    }
+
+    nonisolated private static func driverUninstallCommand() -> String {
+        let destination = shellQuoted("/Library/Audio/Plug-Ins/HAL/PureQ.driver")
+        return [
+            "/bin/rm -rf \(destination)",
+            "(/usr/bin/killall coreaudiod >/dev/null 2>&1 || true)"
+        ].joined(separator: " && ")
+    }
+
+    nonisolated private static func runPrivilegedShellCommand(_ command: String) throws {
+        let process = Process()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = [
+            "-e",
+            "do shell script \(appleScriptStringLiteral(command)) with administrator privileges"
+        ]
+        process.standardError = errorPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw DriverInstallError.privilegedCommandFailed(message?.isEmpty == false ? message! : "Administrator authorization was cancelled or failed.")
+        }
+    }
+
+    nonisolated private static func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    nonisolated private static func appleScriptStringLiteral(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
     }
 
     private func resolvedOutputDeviceIDs(for configuration: AudioEngineConfiguration) -> [String: AudioDeviceID] {
@@ -1929,141 +1626,16 @@ final class EqualizerModel: ObservableObject {
         ].joined(separator: "#")
     }
 
-    func enforceOutputLock() {
-        guard outputLockEnabled else {
-            lockStatus = .unlocked
-            lockMessage = "Output lock is off."
-            return
-        }
-
-        guard let selectedOutputUID else {
-            lockStatus = .needsAttention
-            lockMessage = "Choose an output to lock."
-            return
-        }
-
-        if outputDevices.first(where: { $0.uid == selectedOutputUID })?.isPureQVirtualOutput == true {
-            lockStatus = .needsAttention
-            lockMessage = "Choose speakers/headphones as the render output. PureQ Virtual Output is the system capture output."
-            return
-        }
-
-        let targetAvailable = hardwareOutputDevices.contains(where: { $0.uid == selectedOutputUID })
-        if audioEngine.processTapsAvailable {
-            if targetAvailable {
-                let changedDefault = outputDefaultsNeedChanging(to: selectedOutputUID)
-                let madeDefault = changedDefault ? audioService.setDefaultOutput(uid: selectedOutputUID) : true
-                _ = audioService.setMute(uid: selectedOutputUID, muted: false)
-                releaseSuppressedOutputs()
-
-                if changedDefault && !madeDefault {
-                    lockStatus = .needsAttention
-                    lockMessage = "Could not switch macOS back to \(selectedOutputName)."
-                } else {
-                    lockStatus = .locked
-                    lockMessage = "Locked to \(selectedOutputName). PureQ is using process-tap takeover."
-                }
-
-                if changedDefault {
-                    refreshAudioDevices(enforceLock: false)
-                }
-                return
-            }
-
-            let defaultUIDs = activeOutputDefaultUIDs.filter { $0 != selectedOutputUID }
-            guard !defaultUIDs.isEmpty else {
-                lockStatus = .guarding
-                lockMessage = "Waiting for \(selectedOutputName) to reconnect."
-                return
-            }
-
-            var failedUIDs: [String] = []
-            for uid in defaultUIDs {
-                if audioService.setMute(uid: uid, muted: true) {
-                    suppressedOutputUIDs.insert(uid)
-                } else {
-                    failedUIDs.append(uid)
-                }
-            }
-
-            if failedUIDs.isEmpty {
-                lockStatus = .guarding
-                lockMessage = "Muted undesired output until \(selectedOutputName) reconnects."
-                refreshAudioDevices(enforceLock: false)
-            } else {
-                let failedName = outputDevices.first(where: { $0.uid == failedUIDs[0] })?.name ?? "the current output"
-                lockStatus = .needsAttention
-                lockMessage = "\(failedName) does not expose a mute control."
-            }
-            return
-        }
-
-        if let virtualOutput = pureQVirtualOutputDevice {
-            let changedDefault = outputDefaultsNeedChanging(to: virtualOutput.uid)
-            let madeDefault = changedDefault ? audioService.setDefaultOutput(uid: virtualOutput.uid) : true
-
-            if targetAvailable {
-                _ = audioService.setMute(uid: selectedOutputUID, muted: false)
-            }
-            releaseSuppressedOutputs()
-
-            if changedDefault && !madeDefault {
-                lockStatus = .needsAttention
-                lockMessage = "Could not switch macOS to PureQ Virtual Output."
-            } else if targetAvailable {
-                lockStatus = .locked
-                lockMessage = "System output is PureQ Virtual Output; rendering to \(selectedOutputName)."
-            } else {
-                lockStatus = .guarding
-                lockMessage = "System output is held on PureQ Virtual Output until \(selectedOutputName) reconnects."
-            }
-
-            if changedDefault && madeDefault {
-                refreshAudioDevices(enforceLock: false)
-            }
-            return
-        }
-
-        if targetAvailable {
-            let changedDefault = outputDefaultsNeedChanging(to: selectedOutputUID)
-            let madeDefault = changedDefault ? audioService.setDefaultOutput(uid: selectedOutputUID) : true
-            _ = audioService.setMute(uid: selectedOutputUID, muted: false)
-            releaseSuppressedOutputs()
-
-            if changedDefault && !madeDefault {
-                lockStatus = .needsAttention
-                lockMessage = "Could not switch macOS back to \(selectedOutputName)."
-            } else {
-                lockStatus = .locked
-                lockMessage = "Locked to \(selectedOutputName)."
-            }
-
-            if changedDefault {
-                refreshAudioDevices(enforceLock: false)
-            }
-            return
-        }
-
-        guard let defaultOutputUID, defaultOutputUID != selectedOutputUID else {
-            lockStatus = .guarding
-            lockMessage = "Waiting for \(selectedOutputName) to reconnect."
-            return
-        }
-
-        let muted = audioService.setMute(uid: defaultOutputUID, muted: true)
-        if muted {
-            suppressedOutputUIDs.insert(defaultOutputUID)
-            lockStatus = .guarding
-            lockMessage = "Muted \(defaultOutputName) until \(selectedOutputName) reconnects."
-            refreshAudioDevices(enforceLock: false)
-        } else {
-            lockStatus = .needsAttention
-            lockMessage = "\(defaultOutputName) does not expose a mute control."
-        }
-    }
-
     func addSourceRoutingNode(sourceID: String) {
+        rememberUndo(.routing)
         let source = availableAudioSources.first(where: { $0.id == sourceID }) ?? .systemMix
+        if source.id != AudioSourceItem.systemMixID,
+           replaceSeededSystemMixSource(with: source) {
+            restartAudioEngineIfNeeded()
+            schedulePersistedStateSave()
+            return
+        }
+
         let sourceCount = routingNodes.filter { $0.kind == .source }.count
         let node = RoutingNode(
             title: source.title,
@@ -2078,7 +1650,30 @@ final class EqualizerModel: ObservableObject {
         schedulePersistedStateSave()
     }
 
+    private func replaceSeededSystemMixSource(with source: AudioSourceItem) -> Bool {
+        guard !routingNodes.contains(where: {
+            $0.kind == .source &&
+            ($0.audioSourceID ?? AudioSourceItem.systemMixID) != AudioSourceItem.systemMixID
+        }),
+            let index = routingNodes.firstIndex(where: {
+                $0.kind == .source &&
+                $0.isProtected &&
+                ($0.audioSourceID ?? AudioSourceItem.systemMixID) == AudioSourceItem.systemMixID
+            }) else {
+            return false
+        }
+
+        routingNodes[index].audioSourceID = source.id
+        routingNodes[index].title = source.title
+        routingNodes[index].subtitle = source.subtitle
+        routingNodes[index].isProtected = false
+        selectedRoutingNodeID = routingNodes[index].id
+        patchStartNodeID = nil
+        return true
+    }
+
     func addRoutingNode(kind: RoutingNodeKind) {
+        rememberUndo(.routing)
         let count = routingNodes.count
         let kindCount = routingNodes.filter { $0.kind == kind }.count + 1
         let position = CGPoint(
@@ -2106,6 +1701,9 @@ final class EqualizerModel: ObservableObject {
         scheduleSave: Bool = true,
         selectNode: Bool = true
     ) {
+        if scheduleSave {
+            rememberUndo(.routing)
+        }
         let device = uid.flatMap { targetUID in hardwareOutputDevices.first(where: { $0.uid == targetUID }) }
         let outputCount = routingNodes.filter { $0.kind == .output }.count
         let outputPosition = CGPoint(x: 910, y: 310 + CGFloat(outputCount * 154))
@@ -2129,6 +1727,8 @@ final class EqualizerModel: ObservableObject {
     }
 
     func removeRoutingNode(id: RoutingNode.ID) {
+        guard routingNodes.contains(where: { $0.id == id }) else { return }
+        rememberUndo(.routing)
         routingNodes.removeAll { $0.id == id }
         routingConnections.removeAll { $0.from == id || $0.to == id }
         if selectedRoutingNodeID == id { selectedRoutingNodeID = nil }
@@ -2144,6 +1744,8 @@ final class EqualizerModel: ObservableObject {
             x: position.x.clamped(to: 118...max(118, canvasSize.width - 118)),
             y: position.y.clamped(to: 72...max(72, canvasSize.height - 72))
         )
+        guard routingNodes[index].position != clampedPosition else { return }
+        rememberUndo(.routing)
         routingNodes[index].position = clampedPosition
         schedulePersistedStateSave(after: 1.0)
     }
@@ -2172,6 +1774,7 @@ final class EqualizerModel: ObservableObject {
         var changedGraph = false
         if isValidRoutingConnection(connection),
            !routingConnections.contains(where: { $0.from == startID && $0.to == id }) {
+            rememberUndo(.routing)
             routingConnections.append(connection)
             changedGraph = true
         }
@@ -2184,6 +1787,8 @@ final class EqualizerModel: ObservableObject {
     }
 
     func disconnectRoutingNode(id: RoutingNode.ID) {
+        guard routingConnections.contains(where: { $0.from == id || $0.to == id }) else { return }
+        rememberUndo(.routing)
         routingConnections.removeAll { $0.from == id || $0.to == id }
         restartAudioEngineIfNeeded()
         schedulePersistedStateSave()
@@ -2191,6 +1796,7 @@ final class EqualizerModel: ObservableObject {
 
     func renameRoutingNode(id: RoutingNode.ID, title: String) {
         guard let index = routingNodes.firstIndex(where: { $0.id == id }) else { return }
+        rememberUndo(.routing)
         routingNodes[index].title = title.isEmpty ? routingNodes[index].kind.title : title
         schedulePersistedStateSave()
     }
@@ -2200,6 +1806,7 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        rememberUndo(.routing)
         routingNodes[index].kind = kind
         routingNodes[index].subtitle = subtitle(for: kind)
         if kind == .equalizer {
@@ -2229,6 +1836,7 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        rememberUndo(.equalizer)
         routingNodes[index].eqUsesMainEqualizer = enabled
         if enabled {
             routingNodes[index].eqMode = mode
@@ -2248,6 +1856,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodeMode(id: RoutingNode.ID, mode newMode: EqualizerMode) {
+        rememberUndo(.equalizer)
         updateEQNode(id: id) { node in
             node.eqBands = retargetedBands(for: newMode.frequencies, from: node.eqBands)
             node.eqMode = newMode
@@ -2257,6 +1866,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodeBandLayout(id: RoutingNode.ID, layout: EqualizerBandLayout) {
+        rememberUndo(.equalizer)
         updateEQNode(id: id) { node in
             let currentLayout = bandLayout(for: node.eqMode, bands: node.eqBands)
             switch layout {
@@ -2284,6 +1894,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func applyEQNodeSelection(id: RoutingNode.ID, selection newSelection: EqualizerSelection) {
+        rememberUndo(.equalizer)
         updateEQNode(id: id) { node in
             if newSelection == .manual {
                 restoreManualProfile(for: &node)
@@ -2333,6 +1944,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodePreamp(id: RoutingNode.ID, preamp value: Double) {
+        rememberEqualizerUndo(persist: false, continuousToken: "node-\(id.uuidString)-preamp")
         updateEQNode(id: id) { node in
             node.eqPreamp = value.clamped(to: -20...20)
             node.eqSelection = .manual
@@ -2341,6 +1953,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodeBalance(id: RoutingNode.ID, balance value: Double) {
+        rememberEqualizerUndo(persist: false, continuousToken: "node-\(id.uuidString)-balance")
         updateEQNode(id: id) { node in
             node.eqBalance = value.clamped(to: -1...1)
             node.eqSelection = .manual
@@ -2349,6 +1962,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodeAutoGain(id: RoutingNode.ID, enabled: Bool) {
+        rememberUndo(.equalizer)
         updateEQNode(id: id) { node in
             node.eqAutoGainEnabled = enabled
             applyAutoGainIfNeeded(to: &node)
@@ -2358,24 +1972,48 @@ final class EqualizerModel: ObservableObject {
     }
 
     func setEQNodeBandGain(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID, gain: Double, persist: Bool = true) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "node-\(nodeID.uuidString)-band-gain-\(bandID.uuidString)")
         updateEQNodeBand(nodeID: nodeID, bandID: bandID, scheduleSave: persist) { band in
             band.gain = gain.clamped(to: -20...20)
         }
     }
 
     func setEQNodeBandFrequency(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID, frequency: Double) {
+        rememberUndo(.equalizer)
         updateEQNodeBand(nodeID: nodeID, bandID: bandID, sortAfterMutation: true) { band in
             band.frequency = frequency.clamped(to: 20...20_000)
         }
     }
 
+    func setEQNodeBandGraphPosition(
+        nodeID: RoutingNode.ID,
+        bandID: EqualizerBand.ID,
+        frequency: Double,
+        gain: Double,
+        persist: Bool = true
+    ) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "node-\(nodeID.uuidString)-band-graph-\(bandID.uuidString)")
+        updateEQNodeBand(
+            nodeID: nodeID,
+            bandID: bandID,
+            scheduleSave: persist,
+            sortAfterMutation: persist
+        ) { band in
+            guard band.isEnabled else { return }
+            band.frequency = frequency.clamped(to: 20...20_000)
+            band.gain = gain.clamped(to: -20...20)
+        }
+    }
+
     func setEQNodeBandQ(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID, q: Double, persist: Bool = true) {
+        rememberEqualizerUndo(persist: persist, continuousToken: "node-\(nodeID.uuidString)-band-q-\(bandID.uuidString)")
         updateEQNodeBand(nodeID: nodeID, bandID: bandID, scheduleSave: persist) { band in
             band.q = q.clamped(to: 0.1...10)
         }
     }
 
     func addEQNodeBand(nodeID: RoutingNode.ID) {
+        rememberUndo(.equalizer)
         updateEQNode(id: nodeID) { node in
             let frequency = suggestedCustomBandFrequency(in: node.eqBands)
             node.eqBands.append(EqualizerBand(frequency: frequency, gain: 0, q: 0.5, isCustom: true))
@@ -2387,6 +2025,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func flattenActiveEQAsManual() {
+        rememberUndo(.equalizer)
         if let nodeID = activeEQNode?.id {
             flattenEQNodeAsManual(id: nodeID)
         } else {
@@ -2402,6 +2041,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func createFlatEQNodeFromActiveEQ() {
+        rememberUndo(.routing)
         let sourceBands = activeEQNode?.eqBands ?? bands
         var flatBands = sourceBands
         resetBandsToFlat(&flatBands)
@@ -2435,6 +2075,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     func flattenEQNodeAsManual(id: RoutingNode.ID) {
+        rememberUndo(.equalizer)
         updateEQNode(id: id) { node in
             resetBandsToFlat(&node.eqBands)
             node.eqPreamp = 0
@@ -2445,18 +2086,21 @@ final class EqualizerModel: ObservableObject {
     }
 
     func toggleEQNodeBand(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateEQNodeBand(nodeID: nodeID, bandID: bandID) { band in
             band.isEnabled.toggle()
         }
     }
 
     func toggleEQNodeStereoLink(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateEQNodeBand(nodeID: nodeID, bandID: bandID) { band in
             band.isStereoLinked.toggle()
         }
     }
 
     func cycleEQNodeBandShape(nodeID: RoutingNode.ID, bandID: EqualizerBand.ID) {
+        rememberUndo(.equalizer)
         updateEQNodeBand(nodeID: nodeID, bandID: bandID) { band in
             switch band.shape {
             case .bell:
@@ -2476,6 +2120,7 @@ final class EqualizerModel: ObservableObject {
         }
 
         let source = availableAudioSources.first(where: { $0.id == sourceID }) ?? .systemMix
+        rememberUndo(.routing)
         routingNodes[index].audioSourceID = source.id
         routingNodes[index].title = source.title
         routingNodes[index].subtitle = source.subtitle
@@ -2489,6 +2134,7 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        rememberUndo(.routing)
         routingNodes[index].audioOutputUID = uid
         if let uid,
            let device = hardwareOutputDevices.first(where: { $0.uid == uid }) {
@@ -2503,19 +2149,8 @@ final class EqualizerModel: ObservableObject {
         restartAudioEngineIfNeeded()
     }
 
-    func routeToOutputNode(id: RoutingNode.ID) {
-        guard let node = routingNodes.first(where: { $0.id == id }),
-              node.kind == .output,
-              let uid = node.audioOutputUID,
-              hardwareOutputDevices.contains(where: { $0.uid == uid }) else {
-            return
-        }
-        selectedOutputUID = uid
-        syncRoutingOutputNodes()
-        schedulePersistedStateSave()
-    }
-
     func resetRoutingGraph() {
+        rememberUndo(.routing)
         routingNodes.removeAll()
         routingConnections.removeAll()
         selectedRoutingNodeID = nil
@@ -2555,10 +2190,14 @@ final class EqualizerModel: ObservableObject {
 
     private func startEngineTelemetryPolling() {
         engineTelemetryTimer?.invalidate()
-        let hasVisibleGraphicalSurface = !visibleGraphicalSurfaceIDs.isEmpty
-        let interval = hasVisibleGraphicalSurface
-            ? (highFrameRateUIEnabled ? (1.0 / 60.0) : (1.0 / 18.0))
-            : 1.0
+        let hasActiveVisualTelemetry = !visibleGraphicalSurfaceIDs.isEmpty &&
+            (soundIndicatorsEnabled || spectrumAnalyzerEnabled)
+        let interval: TimeInterval
+        if !hasActiveVisualTelemetry {
+            interval = 1.0
+        } else {
+            interval = 1.0 / visualAnalyzerFrameRate
+        }
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshAudioEngineTelemetry()
@@ -2577,52 +2216,39 @@ final class EqualizerModel: ObservableObject {
     private func refreshAudioEngineTelemetry() {
         let snapshot = audioEngine.telemetry
         audioEngineTelemetry = snapshot
-        guard !visibleGraphicalSurfaceIDs.isEmpty else {
+        if abs(audioEngineSampleRate - snapshot.sampleRate) > 0.5 {
+            audioEngineSampleRate = snapshot.sampleRate
+        }
+        guard !visibleGraphicalSurfaceIDs.isEmpty,
+              soundIndicatorsEnabled || spectrumAnalyzerEnabled else {
             return
         }
-        telemetryStore.publish(snapshot, smoothMeters: highFrameRateUIEnabled)
+        telemetryStore.publish(
+            snapshot,
+            smoothMeters: true,
+            forceVisualRefresh: highFrameRateUIEnabled
+        )
     }
 
-    private func applySelectedOutputAsSystemDefaultIfNeeded() {
-        guard !outputLockEnabled,
-              !isApplyingSelectedOutputDefault,
-              let selectedOutputUID,
-              hardwareOutputDevices.contains(where: { $0.uid == selectedOutputUID }),
-              outputDefaultsNeedChanging(to: selectedOutputUID) else {
-            return
-        }
+    private var visualAnalyzerFrameRate: Double {
+        highFrameRateUIEnabled ? 60.0 : 30.0
+    }
 
-        isApplyingSelectedOutputDefault = true
-        defer { isApplyingSelectedOutputDefault = false }
-
-        if audioService.setDefaultOutput(uid: selectedOutputUID) {
-            let snapshot = audioService.snapshot()
-            if outputDevices != snapshot.devices {
-                outputDevices = snapshot.devices
-            }
-            if defaultOutputUID != snapshot.defaultOutputUID {
-                defaultOutputUID = snapshot.defaultOutputUID
-            }
-            if defaultSystemOutputUID != snapshot.defaultSystemOutputUID {
-                defaultSystemOutputUID = snapshot.defaultSystemOutputUID
-            }
-            if let device = hardwareOutputDevices.first(where: { $0.uid == selectedOutputUID }) {
-                setSelectedOutputNameIfNeeded(device.name)
-            }
-            lockStatus = .unlocked
-            lockMessage = "System output switched to \(selectedOutputName)."
-        } else {
-            lockStatus = .needsAttention
-            lockMessage = "Could not switch macOS to \(selectedOutputName)."
+    @discardableResult
+    private func ensureSystemDefaultForVirtualCapture() throws -> Bool {
+        guard let virtualOutput = pureQVirtualOutputDevice else {
+            return false
         }
+        let needsSwitch = outputDefaultsNeedChanging(to: virtualOutput.uid)
+        let changed = switchSystemDefaultToVirtualOutputForEngine()
+        if needsSwitch && !changed && outputDefaultsNeedChanging(to: virtualOutput.uid) {
+            throw AudioEngineStartError.virtualOutputSwitchFailed(virtualOutput.name)
+        }
+        return changed
     }
 
     @discardableResult
     private func switchSystemDefaultToVirtualOutputForEngine() -> Bool {
-        guard !audioEngine.processTapsAvailable else {
-            return false
-        }
-
         guard let virtualOutput = pureQVirtualOutputDevice else {
             return false
         }
@@ -2631,36 +2257,85 @@ final class EqualizerModel: ObservableObject {
             return false
         }
 
+        if preVirtualDefaultOutputUID == nil {
+            let currentDefault = [defaultOutputUID, defaultSystemOutputUID]
+                .compactMap(\.self)
+                .first { $0 != virtualOutput.uid }
+            preVirtualDefaultOutputUID = currentDefault
+        }
+
         let changed = audioService.setDefaultOutput(uid: virtualOutput.uid)
         if changed {
             refreshAudioDevices(enforceLock: false)
-            lockMessage = "System output is PureQ Virtual Output; rendering to \(selectedOutputName)."
-            if outputLockEnabled {
-                lockStatus = .locked
-            }
         }
         return changed
     }
 
-    private func restoreSystemDefaultToRenderOutput() {
-        guard let selectedOutputUID,
-              hardwareOutputDevices.contains(where: { $0.uid == selectedOutputUID }),
-              outputDefaultsIncludePureQVirtualOutput else {
+    private func restoreSystemDefaultAfterVirtualCapture() {
+        guard let previousUID = preVirtualDefaultOutputUID else {
             return
         }
 
-        if audioService.setDefaultOutput(uid: selectedOutputUID) {
+        preVirtualDefaultOutputUID = nil
+        guard outputDefaultsIncludePureQVirtualOutput,
+              hardwareOutputDevices.contains(where: { $0.uid == previousUID }) else {
+            return
+        }
+
+        if audioService.setDefaultOutput(uid: previousUID) {
             refreshAudioDevices(enforceLock: false)
-            lockStatus = outputLockEnabled ? lockStatus : .unlocked
-            lockMessage = outputLockEnabled ? lockMessage : "Output lock is off."
         }
     }
 
-    private func releaseSuppressedOutputs(except retainedUID: String? = nil) {
-        for uid in suppressedOutputUIDs where uid != retainedUID {
-            _ = audioService.setMute(uid: uid, muted: false)
+    private func normalizeRoutedHardwareOutputVolumes(for configuration: AudioEngineConfiguration) {
+        guard shouldNormalizeHardwareOutputVolumes(for: configuration) else {
+            restoreNormalizedHardwareOutputVolumes()
+            return
         }
-        suppressedOutputUIDs = suppressedOutputUIDs.filter { $0 == retainedUID }
+
+        let hardwareUIDs = Set(hardwareOutputDevices.map(\.uid))
+        let activeOutputUIDs = Set(configuration.renderTargets.map(\.outputUID))
+            .intersection(hardwareUIDs)
+
+        let inactiveLeasedUIDs = Set(normalizedHardwareOutputVolumeStates.keys)
+            .subtracting(activeOutputUIDs)
+        for uid in inactiveLeasedUIDs {
+            restoreNormalizedHardwareOutputVolume(uid: uid)
+        }
+
+        for uid in activeOutputUIDs {
+            if normalizedHardwareOutputVolumeStates[uid] == nil,
+               let state = audioService.volumeState(uid: uid) {
+                normalizedHardwareOutputVolumeStates[uid] = state
+            }
+
+            if audioService.muted(uid: uid) {
+                _ = audioService.setMute(uid: uid, muted: false)
+            }
+
+            let currentScalar = audioService.volumeScalar(uid: uid)
+            if currentScalar == nil || (currentScalar ?? 1) < 0.999 {
+                _ = audioService.setVolumeScalar(uid: uid, scalar: 1)
+            }
+        }
+    }
+
+    private func shouldNormalizeHardwareOutputVolumes(for configuration: AudioEngineConfiguration) -> Bool {
+        outputDefaultsIncludePureQVirtualOutput ||
+            (configuration.virtualCaptureUID != nil && configuration.prefersDriverCapture)
+    }
+
+    private func restoreNormalizedHardwareOutputVolumes() {
+        for uid in Array(normalizedHardwareOutputVolumeStates.keys) {
+            restoreNormalizedHardwareOutputVolume(uid: uid)
+        }
+    }
+
+    private func restoreNormalizedHardwareOutputVolume(uid: String) {
+        guard let state = normalizedHardwareOutputVolumeStates.removeValue(forKey: uid) else {
+            return
+        }
+        _ = audioService.restoreVolumeState(state)
     }
 
     private func outputDefaultsNeedChanging(to uid: String?) -> Bool {
@@ -2675,10 +2350,6 @@ final class EqualizerModel: ObservableObject {
         return defaultOutputUID == virtualOutputUID || defaultSystemOutputUID == virtualOutputUID
     }
 
-    private var activeOutputDefaultUIDs: Set<String> {
-        Set([defaultOutputUID, defaultSystemOutputUID].compactMap(\.self))
-    }
-
     private func routedHardwareOutputUIDs() -> Set<String> {
         let nodeByID = Dictionary(uniqueKeysWithValues: routingNodes.map { ($0.id, $0) })
         let sourceIDs = routingNodes.filter { $0.kind == .source }.map(\.id)
@@ -2690,7 +2361,7 @@ final class EqualizerModel: ObservableObject {
             guard !visited.contains(currentID) else { return }
             if outputNodeIDs.contains(currentID),
                let node = nodeByID[currentID],
-               let uid = node.audioOutputUID ?? renderOutputDevice?.uid,
+               let uid = node.audioOutputUID,
                hardwareOutputDevices.contains(where: { $0.uid == uid }) {
                 outputUIDs.insert(uid)
                 return
@@ -3044,8 +2715,10 @@ final class EqualizerModel: ObservableObject {
                 sortBands(&node.eqBands)
             }
             node.eqSelection = .manual
-            applyAutoGainIfNeeded(to: &node)
-            saveManualProfile(for: &node)
+            if scheduleSave {
+                applyAutoGainIfNeeded(to: &node)
+                saveManualProfile(for: &node)
+            }
         }
     }
 
@@ -3092,7 +2765,10 @@ final class EqualizerModel: ObservableObject {
 
     private func integrateLegacyPureQBusNodes() {
         let legacyBusIDs = routingNodes
-            .filter { $0.kind == .bus && $0.isProtected && $0.title == "PureQ Bus" }
+            .filter {
+                ($0.kind == .bus && $0.isProtected && $0.title == "PureQ Bus") ||
+                ($0.kind == .guardNode && $0.isProtected)
+            }
             .map(\.id)
         guard !legacyBusIDs.isEmpty else { return }
 
@@ -3149,12 +2825,18 @@ final class EqualizerModel: ObservableObject {
             eqBands: bands,
             eqUsesMainEqualizer: false
         )
-        let guardNode = RoutingNode(title: "Output Guard", subtitle: lockStatus.title, kind: .guardNode, position: CGPoint(x: 655, y: 150), isProtected: true)
+        let output = RoutingNode(
+            title: "Output",
+            subtitle: "Unassigned device",
+            kind: .output,
+            position: CGPoint(x: 655, y: 150),
+            audioOutputUID: nil
+        )
 
-        routingNodes = [source, eq, guardNode]
+        routingNodes = [source, eq, output]
         routingConnections = [
             RoutingConnection(from: source.id, to: eq.id),
-            RoutingConnection(from: eq.id, to: guardNode.id)
+            RoutingConnection(from: eq.id, to: output.id)
         ]
         activeEQNodeID = eq.id
         syncRoutingOutputNodes()
@@ -3197,7 +2879,7 @@ final class EqualizerModel: ObservableObject {
                     subtitle: "\(linkLabel) / \(layoutLabel) / \(visibleCount) bands / \(activeCount) active"
                 )
             case .guardNode:
-                setRoutingNodeSubtitleIfNeeded(at: index, subtitle: lockStatus.title)
+                setRoutingNodeSubtitleIfNeeded(at: index, subtitle: "Legacy guard")
             case .output:
                 if let uid = routingNodes[index].audioOutputUID,
                    let device = hardwareOutputDevices.first(where: { $0.uid == uid }) {
@@ -3216,24 +2898,7 @@ final class EqualizerModel: ObservableObject {
             }
         }
 
-        guard !routingNodes.contains(where: { $0.kind == .output }),
-              let outputUID = renderOutputDevice?.uid else {
-            return
-        }
-
-        addOutputRoutingNode(uid: outputUID, restartEngine: false, scheduleSave: false, selectNode: false)
-
-        guard let guardNode = routingNodes.first(where: { $0.kind == .guardNode }),
-              let outputNode = routingNodes.first(where: { $0.kind == .output }) else {
-            return
-        }
-
-        if !routingConnections.contains(where: { $0.from == guardNode.id && $0.to == outputNode.id }) {
-            let connection = RoutingConnection(from: guardNode.id, to: outputNode.id)
-            if isValidRoutingConnection(connection) {
-                routingConnections.append(connection)
-            }
-        }
+        integrateLegacyPureQBusNodes()
     }
 
     private func setRoutingNodeTitleIfNeeded(at index: Int, title: String) {
@@ -3299,7 +2964,7 @@ final class EqualizerModel: ObservableObject {
         case .source: return "Input stream"
         case .bus: return "Stereo bus"
         case .equalizer: return "Unique / Expert / 31 bands / 0 active"
-        case .guardNode: return lockStatus.title
+        case .guardNode: return "Legacy guard"
         case .output: return "Device output"
         case .monitor: return "Meter tap"
         }
@@ -3308,7 +2973,6 @@ final class EqualizerModel: ObservableObject {
     private func outputSubtitle(for device: AudioOutputDevice?) -> String {
         guard let device else { return "Unassigned device" }
         let labels = [
-            device.uid == selectedOutputUID ? "Desired" : nil,
             device.isDefaultOutput ? "Default" : nil,
             device.isDefaultSystemOutput ? "System" : nil,
             device.isMuted ? "Muted" : nil,
@@ -3317,29 +2981,75 @@ final class EqualizerModel: ObservableObject {
         return labels.joined(separator: " / ")
     }
 
-    private var preferredHardwareOutputDevice: AudioOutputDevice? {
-        if let defaultOutputUID,
-           let defaultHardwareOutput = hardwareOutputDevices.first(where: { $0.uid == defaultOutputUID }) {
-            return defaultHardwareOutput
-        }
-        return hardwareOutputDevices.first
-    }
-
-    private var renderOutputDevice: AudioOutputDevice? {
-        if let selectedOutput {
-            return selectedOutput
-        }
-        if outputLockEnabled && selectedOutputUID != nil {
-            return nil
-        }
-        return preferredHardwareOutputDevice
-    }
-
     private var virtualCaptureDeviceForEngine: AudioOutputDevice? {
-        guard outputLockEnabled, !audioEngine.processTapsAvailable else {
+        guard !audioEngine.processTapsAvailable,
+              routingGraphHasRoutableSource,
+              let virtualOutput = pureQVirtualOutputDevice else {
             return nil
         }
-        return pureQVirtualOutputDevice
+        if routingGraphUsesSystemMix {
+            return virtualOutput
+        }
+        return virtualOutput
+    }
+
+    private var routingGraphHasRoutableSource: Bool {
+        let sourceNodes = routingNodes.filter { $0.kind == .source }
+        let outputNodeIDs = Set(routingNodes.compactMap { node -> RoutingNode.ID? in
+            guard node.kind == .output, node.audioOutputUID != nil else { return nil }
+            return node.id
+        })
+        guard !sourceNodes.isEmpty, !outputNodeIDs.isEmpty else { return false }
+
+        let adjacency = Dictionary(grouping: routingConnections, by: \.from)
+        return sourceNodes.contains { node in
+            sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency)
+        }
+    }
+
+    private var routingGraphUsesSystemMix: Bool {
+        let sourceNodes = routingNodes.filter { $0.kind == .source }
+        let outputNodeIDs = Set(routingNodes.compactMap { node -> RoutingNode.ID? in
+            guard node.kind == .output, node.audioOutputUID != nil else { return nil }
+            return node.id
+        })
+        guard !sourceNodes.isEmpty, !outputNodeIDs.isEmpty else { return false }
+
+        let adjacency = Dictionary(grouping: routingConnections, by: \.from)
+        let hasSpecificSourceRoute = sourceNodes.contains { node in
+            (node.audioSourceID ?? AudioSourceItem.systemMixID) != AudioSourceItem.systemMixID &&
+            sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency)
+        }
+
+        for node in sourceNodes where (node.audioSourceID ?? AudioSourceItem.systemMixID) == AudioSourceItem.systemMixID {
+            if hasSpecificSourceRoute && node.isProtected {
+                continue
+            }
+            if sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func sourceNode(
+        _ sourceID: RoutingNode.ID,
+        reachesOutputIn outputNodeIDs: Set<RoutingNode.ID>,
+        adjacency: [RoutingNode.ID: [RoutingConnection]]
+    ) -> Bool {
+        var visited = Set<RoutingNode.ID>()
+        var stack = adjacency[sourceID, default: []].map(\.to)
+
+        while let currentID = stack.popLast() {
+            guard visited.insert(currentID).inserted else { continue }
+            if outputNodeIDs.contains(currentID) {
+                return true
+            }
+            stack.append(contentsOf: adjacency[currentID, default: []].map(\.to))
+        }
+
+        return false
     }
 
     private func sourceKind(for bundleIdentifier: String) -> AudioSourceKind {
@@ -3417,43 +3127,6 @@ final class EqualizerModel: ObservableObject {
         )
     }
 
-    private var selectedOutputReadiness: TestReadinessItem {
-        guard selectedOutputUID != nil else {
-            return TestReadinessItem(
-                id: "selected-output",
-                title: "Desired Output",
-                detail: "Choose an output before testing output lock.",
-                state: .caution
-            )
-        }
-
-        if let selectedOutputUID,
-           outputDevices.first(where: { $0.uid == selectedOutputUID })?.isPureQVirtualOutput == true {
-            return TestReadinessItem(
-                id: "selected-output",
-                title: "Desired Output",
-                detail: "PureQ Virtual Output is the system capture output. Choose speakers, headphones, or another hardware output for rendering.",
-                state: .blocked
-            )
-        }
-
-        return TestReadinessItem(
-            id: "selected-output",
-            title: "Desired Output",
-            detail: "Render target: \(selectedOutputName)",
-            state: selectedOutput == nil ? .caution : .ready
-        )
-    }
-
-    private var outputLockReadiness: TestReadinessItem {
-        TestReadinessItem(
-            id: "output-lock",
-            title: "Output Lock",
-            detail: outputLockEnabled ? lockMessage : "Toggle Lock to keep macOS on the desired hardware output and mute unwanted fallback outputs.",
-            state: outputLockEnabled ? (lockStatus == .needsAttention ? .caution : .ready) : .caution
-        )
-    }
-
     private var routingGraphReadiness: TestReadinessItem {
         let hasRoute = !routingConnections.isEmpty && routingNodes.contains(where: { $0.kind == .output })
         return TestReadinessItem(
@@ -3525,20 +3198,4 @@ final class EqualizerModel: ObservableObject {
 
         return pairs
     }
-}
-
-extension Comparable {
-    func clamped(to limits: ClosedRange<Self>) -> Self {
-        min(max(self, limits.lowerBound), limits.upperBound)
-    }
-}
-
-extension Color {
-    static let pureQBackground = Color(red: 0.09, green: 0.10, blue: 0.12)
-    static let pureQPanel = Color(red: 0.15, green: 0.16, blue: 0.18)
-    static let pureQControl = Color(red: 0.10, green: 0.11, blue: 0.13)
-    static let pureQStroke = Color.white.opacity(0.10)
-    static let pureQGreen = Color(red: 0.34, green: 0.64, blue: 0.51)
-    static let pureQAmber = Color(red: 0.98, green: 0.75, blue: 0.10)
-    static let pureQOrange = Color(red: 1.00, green: 0.34, blue: 0.08)
 }

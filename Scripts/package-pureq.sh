@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 
+export COPYFILE_DISABLE=1
+export COPY_EXTENDED_ATTRIBUTES_DISABLE=1
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT="$ROOT_DIR/PureQ.xcodeproj"
 DERIVED_DATA="$ROOT_DIR/DerivedData/Package"
@@ -11,6 +14,10 @@ PACKAGE_ROOT="$PACKAGE_WORK_DIR/root"
 PACKAGE_SCRIPTS="$PACKAGE_WORK_DIR/scripts"
 COMPONENT_PLIST="$PACKAGE_WORK_DIR/components.plist"
 PKG_SIGNING_IDENTITY="${PKG_SIGNING_IDENTITY:-}"
+CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}"
+CODE_SIGNING_REQUIRED="${CODE_SIGNING_REQUIRED:-NO}"
+CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
+APPLICATION_SIGNING_IDENTITY="${APPLICATION_SIGNING_IDENTITY:-$CODE_SIGN_IDENTITY}"
 
 APP_VERSION="$(
   xcodebuild -project "$PROJECT" -target PureQ -configuration "$CONFIGURATION" -showBuildSettings 2>/dev/null \
@@ -29,6 +36,10 @@ xcodebuild \
   -scheme PureQ \
   -configuration "$CONFIGURATION" \
   -derivedDataPath "$DERIVED_DATA" \
+  CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED" \
+  CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" \
+  CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+  clean \
   build
 
 APP_SRC="$DERIVED_DATA/Build/Products/$CONFIGURATION/PureQ.app"
@@ -44,27 +55,90 @@ if [[ ! -d "$DRIVER_SRC" ]]; then
   exit 1
 fi
 
+sign_bundle() {
+  local bundle_path="$1"
+  local identity="$APPLICATION_SIGNING_IDENTITY"
+  local signing_args=(--force --deep)
+
+  if [[ -z "$identity" ]]; then
+    identity="-"
+  fi
+
+  signing_args+=(--sign "$identity")
+  if [[ "$identity" == "-" ]]; then
+    signing_args+=(--timestamp=none)
+  else
+    signing_args+=(--options runtime --timestamp)
+  fi
+
+  /usr/bin/codesign "${signing_args[@]}" "$bundle_path"
+}
+
+echo "Signing package payload..."
+sign_bundle "$DRIVER_SRC"
+sign_bundle "$APP_SRC"
+
 rm -rf "$PACKAGE_ROOT" "$PACKAGE_SCRIPTS" "$COMPONENT_PLIST" "$PKG_PATH"
 mkdir -p \
   "$PACKAGE_ROOT/Applications" \
+  "$PACKAGE_ROOT/Library/Application Support/PureQ" \
   "$PACKAGE_ROOT/Library/Audio/Plug-Ins/HAL" \
   "$PACKAGE_SCRIPTS" \
   "$DIST_DIR"
 
 COPYFILE_DISABLE=1 ditto --norsrc --noextattr "$APP_SRC" "$PACKAGE_ROOT/Applications/PureQ.app"
 COPYFILE_DISABLE=1 ditto --norsrc --noextattr "$DRIVER_SRC" "$PACKAGE_ROOT/Library/Audio/Plug-Ins/HAL/PureQ.driver"
+COPYFILE_DISABLE=1 ditto --norsrc --noextattr "$ROOT_DIR/Scripts/uninstall-pureq.sh" "$PACKAGE_ROOT/Library/Application Support/PureQ/uninstall-pureq.sh"
+chmod 755 "$PACKAGE_ROOT/Library/Application Support/PureQ/uninstall-pureq.sh"
+
+cat > "$PACKAGE_ROOT/Applications/PureQ Uninstall.command" <<'UNINSTALL_WRAPPER'
+#!/bin/zsh
+exec "/Library/Application Support/PureQ/uninstall-pureq.sh" "$@"
+UNINSTALL_WRAPPER
+chmod 755 "$PACKAGE_ROOT/Applications/PureQ Uninstall.command"
+
 /usr/bin/xattr -cr "$PACKAGE_ROOT" 2>/dev/null || true
 /usr/bin/find "$PACKAGE_ROOT" -name '._*' -delete
+
+cat > "$PACKAGE_SCRIPTS/preinstall" <<'PREINSTALL'
+#!/bin/zsh
+set -e
+
+/usr/bin/osascript -e 'tell application id "Sean-s-Apps.PureQ" to quit' >/dev/null 2>&1 || true
+/bin/sleep 1
+/usr/bin/pkill -x PureQ >/dev/null 2>&1 || true
+
+/bin/rm -rf "/Applications/PureQ.app"
+/bin/rm -rf "/Library/Audio/Plug-Ins/HAL/PureQ.driver"
+
+exit 0
+PREINSTALL
 
 cat > "$PACKAGE_SCRIPTS/postinstall" <<'POSTINSTALL'
 #!/bin/zsh
 set -e
 
+APP_PATH="/Applications/PureQ.app"
 DRIVER_PATH="/Library/Audio/Plug-Ins/HAL/PureQ.driver"
+UNINSTALL_SCRIPT="/Library/Application Support/PureQ/uninstall-pureq.sh"
+UNINSTALL_COMMAND="/Applications/PureQ Uninstall.command"
+
+if [[ -d "$APP_PATH" ]]; then
+  /usr/bin/xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+fi
+
+if [[ -f "$UNINSTALL_SCRIPT" ]]; then
+  /bin/chmod 755 "$UNINSTALL_SCRIPT" 2>/dev/null || true
+fi
+
+if [[ -f "$UNINSTALL_COMMAND" ]]; then
+  /bin/chmod 755 "$UNINSTALL_COMMAND" 2>/dev/null || true
+fi
 
 if [[ -d "$DRIVER_PATH" ]]; then
   /usr/sbin/chown -R root:wheel "$DRIVER_PATH" 2>/dev/null || true
   /bin/chmod -R go-w "$DRIVER_PATH" 2>/dev/null || true
+  /usr/bin/xattr -cr "$DRIVER_PATH" 2>/dev/null || true
 fi
 
 /usr/bin/killall coreaudiod 2>/dev/null || true
@@ -72,7 +146,7 @@ fi
 exit 0
 POSTINSTALL
 
-chmod +x "$PACKAGE_SCRIPTS/postinstall"
+chmod +x "$PACKAGE_SCRIPTS/preinstall" "$PACKAGE_SCRIPTS/postinstall"
 
 COPYFILE_DISABLE=1 pkgbuild --analyze --root "$PACKAGE_ROOT" "$COMPONENT_PLIST"
 
@@ -101,6 +175,10 @@ PKGBUILD_ARGS=(
   --root "$PACKAGE_ROOT"
   --scripts "$PACKAGE_SCRIPTS"
   --component-plist "$COMPONENT_PLIST"
+  --filter "\\.DS_Store$"
+  --filter "/CVS($|/)"
+  --filter "/\\.svn($|/)"
+  --filter "/\\._[^/]*$"
   --identifier "Sean-s-Apps.PureQ.pkg"
   --version "$APP_VERSION"
   --install-location "/"

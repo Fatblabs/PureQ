@@ -1,12 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
 
-INSTALL_PATH="/Library/Audio/Plug-Ins/HAL/PureQ.driver"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-if [[ -d "$INSTALL_PATH" ]]; then
-  sudo rm -rf "$INSTALL_PATH"
-  sudo killall -9 coreaudiod
-  echo "Removed PureQ.driver"
-else
-  echo "PureQ.driver is not installed"
-fi
+REMOVE_APP=0 REMOVE_SUPPORT=0 "$ROOT_DIR/Scripts/uninstall-pureq.sh"
