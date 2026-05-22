@@ -1,70 +1,99 @@
 # PureQ 🎛️
 
-[![Platform](https://img.shields.io/badge/Platform-macOS%2014.2+-blue.svg)]()
-[![Swift](https://img.shields.io/badge/Swift-5.9+-F05138.svg)]()
-[![Architecture](https://img.shields.io/badge/Architecture-CoreAudio%20%7C%20AVFoundation-lightgrey)]()
+[![Platform](https://img.shields.io/badge/Platform-macOS-blue)](https://github.com/Fatblabs/PureQ)
+[![Swift](https://img.shields.io/badge/Swift-5.9+-F05138.svg)](https://swift.org)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](https://github.com/Fatblabs/PureQ/blob/main/LICENSE)
 
-**PureQ** is a high-performance, native macOS system-wide parametric equalizer and node-based audio router. 
+PureQ is a native macOS system-wide parametric equalizer and node-based audio router. It provides per-application taps, flexible routing, and real-time EQ processing using a combination of Swift (SwiftUI) and a small CoreAudio driver.
 
-Built entirely in Swift and C using Apple's modern `AVFoundation` and low-level `CoreAudio` APIs, PureQ allows you to capture system audio or isolate specific running applications, route them through custom parametric EQ nodes, and lock your playback to a dedicated hardware output.
-
----
-
-## ✨ Features
-
-* **Node-Based Audio Routing:** Visually patch audio sources (System Mix, Safari, Spotify, Games) to distinct Equalizer profiles and direct them to specific hardware outputs using a flexible, drag-and-drop node canvas.
-* **Precision Parametric Equalizer:** Switch between 10-band, 31-band, or fully custom frequency layouts. Adjust gain, Q-factor, and filter shapes (Bell, Shelf, Notch) with real-time audio smoothing and auto-preamp gain staging.
-* **App-Specific Process Taps:** On macOS 14.2+, PureQ uses native `AudioHardwareCreateProcessTap` to cleanly intercept audio from individual apps without installing kernel extensions.
-* **Output Lock & Guarding:** Automatically locks macOS to your preferred speakers or headphones. If your device disconnects, PureQ suppresses unwanted fallback devices (like your MacBook speakers) to prevent embarrassing audio leaks.
-* **Real-Time Spectrum Analyzer:** A highly responsive FFT spectrum analyzer (`vDSP` powered) integrated directly behind your EQ curve.
-* **Menu Bar Integration:** Quickly toggle the EQ, adjust the preamp, change your target output, or swap presets without opening the main window.
-* **Import/Export Profiles:** Save your finely tuned audio profiles as `.pureqeq` files and share them.
+Key goals:
+- Low-latency, system-wide audio processing
+- Per-app routing and EQ profiles
+- Easy-to-use node-based routing canvas
 
 ---
 
-## 🚀 Installation
-
-PureQ is distributed as a pre-compiled macOS Application. You do not need to build it from source to use it.
-
-1. Go to the **[Releases](../../releases)** page.
-2. Download the latest `PureQ.dmg` file.
-3. Open the `.dmg` and drag the **PureQ** app into your `Applications` folder.
-4. Launch PureQ. *(Note: You may need to right-click and select "Open" on the first launch due to macOS Gatekeeper if the app is unsigned).*
+## Highlights
+- Node-based audio routing (system mix and per-app taps)
+- Precision parametric EQ with customizable bands and filter types
+- Optional virtual audio device driver for loopback routing (`PureQDriver.c`)
+- Real-time spectrum analyzer and menu-bar controls
+- Import/export EQ presets and session files
 
 ---
 
-## 🏗️ Architecture & Codebase Overview
+## Quick Install (end users)
 
-For developers interested in how PureQ manipulates macOS audio, the project is split into a SwiftUI frontend and a CoreAudio/AVEngine backend:
+Pre-built releases are the recommended way to use PureQ. Visit the Releases page and download the latest `.dmg`.
 
-### 1. The Audio Engine (`AudioEngineService.swift`)
-The heart of the app. It constructs an `AVAudioEngine` topology on the fly. Depending on your macOS version and routing graph, it either hooks into a running application via `CATapDescription` or falls back to capturing the `PureQ Virtual Output` loopback driver. It manages `AVAudioUnitEQ` nodes and calculates multi-band parametric filters in real time.
-
-### 2. Output Device Management (`AudioOutputService.swift`)
-A pure CoreAudio wrapper that queries `kAudioHardwarePropertyDevices`. It handles dynamically switching the macOS default output device, detecting hardware sample rates, and muting fallback speakers (`kAudioDevicePropertyMute`) to enforce the Output Lock feature.
-
-### 3. The CoreAudio HAL Driver (`PureQDriver.c`)
-A lightweight, user-space Audio Server Plug-in written in C. It registers a virtual audio device (`PureQ Virtual Output`) and a shared memory ring buffer (`/tmp/PureQAudioRing.v1`). For older systems or specific routing needs, this driver acts as a "dummy" output that macOS targets, allowing the PureQ Swift app to tap the buffer and process the global mix.
-
-### 4. Reactive State (`EqualizerModel.swift`)
-The `@MainActor` Observable Object. It acts as the source of truth for the node routing canvas, connection validations, active EQ bands, presets (e.g., Bass Lift, Vocal Focus), telemetry polling, and saving/restoring your session (`.pureqsession.json`).
-
-### 5. Native SwiftUI Interface (`ContentView.swift` & `PureQApp.swift`)
-PureQ features a custom, hardware-accelerated UI utilizing SwiftUI `Canvas` for drawing the active audio connections, the FFT spectrum graph, and custom vertical faders. It scales seamlessly from a full-window routing workspace down to a compact Menu Bar extra.
+1. Open Releases: https://github.com/Fatblabs/PureQ/releases
+2. Download `PureQ.dmg` for your macOS version.
+3. Open the `.dmg` and drag the app into `/Applications`.
+4. On first launch you may need to allow the app in System Settings → Privacy & Security if Gatekeeper blocks it.
 
 ---
 
-## 🛠️ Building from Source
+## Build & Run (developers)
 
-If you want to contribute or build PureQ yourself:
+Requirements:
+- macOS 14+ (development) — app will attempt to gracefully fall back on older OSes where possible
+- Xcode 15+
+- Swift 5.9
 
-1. Clone the repository: `git clone https://github.com/yourusername/PureQ.git`
-2. Open `PureQ.xcodeproj` in Xcode 15+.
-3. **Important:** PureQ uses a C-based CoreAudio driver. Ensure the `PureQDriver` target is built and embedded into the app bundle. To install the driver manually for local testing, copy `PureQ.driver` to `/Library/Audio/Plug-Ins/HAL/` and restart `coreaudiod` (`sudo killall coreaudiod`).
-4. Select your Mac as the destination and hit `Cmd + R` to run.
+Steps to build locally:
+
+```bash
+git clone https://github.com/Fatblabs/PureQ.git
+cd PureQ
+open PureQ.xcodeproj
+```
+
+If you need the virtual audio driver for loopback routing (used by some routing modes), run the included helper script to install the driver locally:
+
+```bash
+sudo ./Scripts/install-pureq-driver.sh
+# When done, restart coreaudiod if prompted:
+sudo killall coreaudiod
+```
+
+Notes for developers:
+- The Xcode workspace contains two primary targets: the SwiftUI app and a small C-based driver (`PureQDriver`).
+- Building and embedding the driver requires proper code signing for distribution. For local testing the script places the driver under `/Library/Audio/Plug-Ins/HAL/`.
 
 ---
 
-## 📝 License
+## Project structure (short)
 
-This project is open-source and available under the MIT License.
+- `PureQ/` — Swift/SwiftUI application sources
+- `PureQDriver/` — C CoreAudio driver and helper sources
+- `Scripts/` — install/uninstall helper scripts for the driver and packaging
+- `build/` — Xcode build artifacts (ignored by git)
+
+If you want to explore code paths mentioned in this README, start with:
+- [PureQ/](PureQ) — UI and app logic
+- [PureQDriver/](PureQDriver) — virtual device implementation
+- [Scripts/install-pureq-driver.sh](Scripts/install-pureq-driver.sh) — driver install helper
+
+---
+
+## Contributing
+
+Contributions are welcome. If you're submitting changes:
+
+1. Fork the repo and create a feature branch.
+2. Open a pull request against `main` with a clear description of the change.
+3. If your change affects audio behavior, include reproduction steps and testing notes.
+
+If you need help getting the driver installed for local development, open an issue and include your macOS version and Xcode version.
+
+---
+
+## Security & Privacy
+
+PureQ interacts with system audio devices and may require permissions. The app does not collect telemetry by default. If you add diagnostic features, treat any logs with user consent and avoid recording raw audio.
+
+---
+
+## License
+
+This repository is licensed under the MIT License. See [LICENSE](LICENSE) for details.
