@@ -97,6 +97,8 @@ final class EqualizerModel: ObservableObject {
     private var pollTimer: Timer?
     private var engineTelemetryTimer: Timer?
     private var autoStartWorkItem: DispatchWorkItem?
+    private var audioDeviceRefreshWorkItem: DispatchWorkItem?
+    private var audioEngineRecoveryWorkItem: DispatchWorkItem?
     private var persistenceWorkItem: DispatchWorkItem?
     private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var persistenceSaveToken: UUID?
@@ -109,7 +111,10 @@ final class EqualizerModel: ObservableObject {
     private var routingUndoStack: [PureQSessionSnapshot] = []
     private var equalizerContinuousUndoTokens = Set<String>()
     private var equalizerContinuousUndoResetWorkItems: [String: DispatchWorkItem] = [:]
+    private var routingContinuousUndoTokens = Set<String>()
+    private var routingContinuousUndoResetWorkItems: [String: DispatchWorkItem] = [:]
     private var lastAutoStartFailureSignature: String?
+    private var lastRenderWatchdogSample: (callbacks: UInt64, frames: UInt64, date: Date)?
     private var isStartingAudioEngine = false
     private var manualStopSuppressesAutoStart = false
     private var preVirtualDefaultOutputUID: String?
@@ -208,6 +213,10 @@ final class EqualizerModel: ObservableObject {
         return "\(layoutLabel) / \(activeCount) active / \(autoLabel)"
     }
 
+    var activeEQClippingStatus: EQClippingStatus {
+        clippingStatus(for: activeEQGraphBands, preamp: activeEQPreamp, sampleRate: audioEngineSampleRate)
+    }
+
     var hardwareOutputDevices: [AudioOutputDevice] {
         outputDevices.filter { !$0.isPureQVirtualOutput }
     }
@@ -302,26 +311,49 @@ final class EqualizerModel: ObservableObject {
             seedRoutingGraphIfNeeded()
         }
         startDevicePolling()
+        startCoreAudioDeviceObserver()
         startLifecycleRefreshObservers()
         scheduleAutoStartIfNeeded()
     }
 
     deinit {
-        restoreNormalizedHardwareOutputVolumes()
-        pollTimer?.invalidate()
-        engineTelemetryTimer?.invalidate()
+        prepareForApplicationExit()
+    }
+
+    func prepareForApplicationExit() {
         autoStartWorkItem?.cancel()
+        autoStartWorkItem = nil
+        audioDeviceRefreshWorkItem?.cancel()
+        audioDeviceRefreshWorkItem = nil
+        audioEngineRecoveryWorkItem?.cancel()
+        audioEngineRecoveryWorkItem = nil
+
+        stopAudioEngine(manual: true)
+
+        pollTimer?.invalidate()
+        pollTimer = nil
+        engineTelemetryTimer?.invalidate()
+        engineTelemetryTimer = nil
         persistenceWorkItem?.cancel()
+        persistenceWorkItem = nil
         equalizerContinuousUndoResetWorkItems.values.forEach { $0.cancel() }
+        equalizerContinuousUndoResetWorkItems.removeAll()
+        equalizerContinuousUndoTokens.removeAll()
+        routingContinuousUndoResetWorkItems.values.forEach { $0.cancel() }
+        routingContinuousUndoResetWorkItems.removeAll()
+        routingContinuousUndoTokens.removeAll()
+
+        audioService.stopObservingDeviceChanges()
         if let observedPureQVolumeDeviceID {
-            let audioService = audioService
-            Task { @MainActor in
-                audioService.stopObservingVolumeChanges(deviceID: observedPureQVolumeDeviceID)
-            }
+            audioService.stopObservingVolumeChanges(deviceID: observedPureQVolumeDeviceID)
+            self.observedPureQVolumeDeviceID = nil
         }
         for (center, observer) in lifecycleObservers {
             center.removeObserver(observer)
         }
+        lifecycleObservers.removeAll()
+
+        flushPersistedState()
     }
 
     func setActiveUndoScope(_ scope: PureQUndoScope?) {
@@ -636,6 +668,25 @@ final class EqualizerModel: ObservableObject {
         rememberUndo(.equalizer)
     }
 
+    private func rememberRoutingUndo(persist: Bool = true, continuousToken: String? = nil) {
+        guard persist else {
+            guard let continuousToken else { return }
+            if routingContinuousUndoTokens.insert(continuousToken).inserted {
+                rememberUndo(.routing)
+            }
+            scheduleRoutingContinuousUndoReset(for: continuousToken)
+            return
+        }
+
+        if let continuousToken,
+           routingContinuousUndoTokens.remove(continuousToken) != nil {
+            routingContinuousUndoResetWorkItems[continuousToken]?.cancel()
+            routingContinuousUndoResetWorkItems[continuousToken] = nil
+            return
+        }
+        rememberUndo(.routing)
+    }
+
     private func scheduleEqualizerContinuousUndoReset(for token: String) {
         equalizerContinuousUndoResetWorkItems[token]?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -645,6 +696,18 @@ final class EqualizerModel: ObservableObject {
             }
         }
         equalizerContinuousUndoResetWorkItems[token] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: workItem)
+    }
+
+    private func scheduleRoutingContinuousUndoReset(for token: String) {
+        routingContinuousUndoResetWorkItems[token]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.routingContinuousUndoTokens.remove(token)
+                self?.routingContinuousUndoResetWorkItems[token] = nil
+            }
+        }
+        routingContinuousUndoResetWorkItems[token] = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: workItem)
     }
 
@@ -1243,7 +1306,11 @@ final class EqualizerModel: ObservableObject {
 
     func refreshAudioDevices(enforceLock: Bool = true) {
         let previousTakeoverActive = audioEngineTakeoverActive
+        let wasRunning = audioEngineRunState == .running
         let snapshot = audioService.snapshot()
+        let devicesChanged = outputDevices != snapshot.devices
+        let outputDefaultChanged = defaultOutputUID != snapshot.defaultOutputUID
+        let systemOutputDefaultChanged = defaultSystemOutputUID != snapshot.defaultSystemOutputUID
         if outputDevices != snapshot.devices {
             outputDevices = snapshot.devices
         }
@@ -1256,9 +1323,33 @@ final class EqualizerModel: ObservableObject {
 
         syncRoutingOutputNodes()
         updatePureQVolumeBridge()
-        if previousTakeoverActive != audioEngineTakeoverActive {
+
+        if wasRunning {
+            let configuration = audioEngineConfiguration
+            let resolvedOutputCount = resolvedOutputDeviceIDs(for: configuration).count
+            if resolvedOutputCount != configuration.renderTargets.count {
+                stopAudioEngine(manual: false)
+                scheduleAutoStartIfNeeded()
+                return
+            }
+
+            if devicesChanged ||
+                outputDefaultChanged ||
+                systemOutputDefaultChanged ||
+                previousTakeoverActive != audioEngineTakeoverActive {
+                lastAutoStartFailureSignature = nil
+                restartAudioEngineIfNeeded()
+                return
+            }
+
+            updateAudioEngineRendering(scheduleSave: false)
+        } else if previousTakeoverActive != audioEngineTakeoverActive {
+            lastAutoStartFailureSignature = nil
             restartAudioEngineIfNeeded()
         } else {
+            if devicesChanged || outputDefaultChanged || systemOutputDefaultChanged {
+                lastAutoStartFailureSignature = nil
+            }
             scheduleAutoStartIfNeeded()
         }
     }
@@ -1387,6 +1478,7 @@ final class EqualizerModel: ObservableObject {
             normalizeRoutedHardwareOutputVolumes(for: configuration)
             lastAutoStartFailureSignature = nil
             setAudioEngineRunState(audioEngine.runState)
+            lastRenderWatchdogSample = nil
             refreshAudioEngineTelemetry()
             startEngineTelemetryPolling()
         } catch {
@@ -1414,6 +1506,7 @@ final class EqualizerModel: ObservableObject {
         audioEngine.stopRendering()
         restoreNormalizedHardwareOutputVolumes()
         setAudioEngineRunState(audioEngine.runState)
+        lastRenderWatchdogSample = nil
         stopEngineTelemetryPolling()
         refreshAudioEngineTelemetry()
         if manual {
@@ -1605,6 +1698,9 @@ final class EqualizerModel: ObservableObject {
                     node.kind.rawValue,
                     node.audioSourceID ?? "",
                     node.audioOutputUID ?? "",
+                    String(format: "%.3f", node.sourceVolumeValue),
+                    "\(node.sourceMutedValue)",
+                    "\(node.sourceSoloedValue)",
                     node.eqSelection.rawValue,
                     String(format: "%.2f", node.eqPreamp),
                     String(format: "%.2f", node.eqBalance)
@@ -1641,8 +1737,11 @@ final class EqualizerModel: ObservableObject {
             title: source.title,
             subtitle: source.subtitle,
             kind: .source,
-            position: CGPoint(x: 145, y: 150 + CGFloat(sourceCount * 154)),
-            audioSourceID: source.id
+            position: CGPoint(x: 145, y: 150 + CGFloat(sourceCount * 174)),
+            audioSourceID: source.id,
+            sourceVolume: 1,
+            sourceMuted: false,
+            sourceSoloed: false
         )
         routingNodes.append(node)
         selectedRoutingNodeID = node.id
@@ -2123,7 +2222,69 @@ final class EqualizerModel: ObservableObject {
         rememberUndo(.routing)
         routingNodes[index].audioSourceID = source.id
         routingNodes[index].title = source.title
-        routingNodes[index].subtitle = source.subtitle
+        routingNodes[index].subtitle = sourceSubtitle(for: source, node: routingNodes[index])
+        schedulePersistedStateSave()
+        restartAudioEngineIfNeeded()
+    }
+
+    func routingSourceVolume(id: RoutingNode.ID) -> Double {
+        routingNodes.first(where: { $0.id == id })?.sourceVolumeValue ?? 1
+    }
+
+    func routingSourceMuted(id: RoutingNode.ID) -> Bool {
+        routingNodes.first(where: { $0.id == id })?.sourceMutedValue ?? false
+    }
+
+    func routingSourceSoloed(id: RoutingNode.ID) -> Bool {
+        routingNodes.first(where: { $0.id == id })?.sourceSoloedValue ?? false
+    }
+
+    func setRoutingSourceVolume(id: RoutingNode.ID, volume: Double, persist: Bool = true) {
+        guard let index = routingNodes.firstIndex(where: { $0.id == id }),
+              routingNodes[index].kind == .source else {
+            return
+        }
+
+        rememberRoutingUndo(persist: persist, continuousToken: "source-volume-\(id.uuidString)")
+        let clampedVolume = volume.clamped(to: 0...2)
+        guard abs(routingNodes[index].sourceVolumeValue - clampedVolume) > 0.000_1 else {
+            if persist {
+                schedulePersistedStateSave()
+            }
+            return
+        }
+
+        routingNodes[index].sourceVolumeValue = clampedVolume
+        syncRoutingOutputNodes()
+        updateAudioEngineRendering(scheduleSave: persist)
+    }
+
+    func commitRoutingSourceVolume(id: RoutingNode.ID) {
+        setRoutingSourceVolume(id: id, volume: routingSourceVolume(id: id), persist: true)
+    }
+
+    func toggleRoutingSourceMute(id: RoutingNode.ID) {
+        guard let index = routingNodes.firstIndex(where: { $0.id == id }),
+              routingNodes[index].kind == .source else {
+            return
+        }
+
+        rememberUndo(.routing)
+        routingNodes[index].sourceMutedValue.toggle()
+        syncRoutingOutputNodes()
+        schedulePersistedStateSave()
+        restartAudioEngineIfNeeded()
+    }
+
+    func toggleRoutingSourceSolo(id: RoutingNode.ID) {
+        guard let index = routingNodes.firstIndex(where: { $0.id == id }),
+              routingNodes[index].kind == .source else {
+            return
+        }
+
+        rememberUndo(.routing)
+        routingNodes[index].sourceSoloedValue.toggle()
+        syncRoutingOutputNodes()
         schedulePersistedStateSave()
         restartAudioEngineIfNeeded()
     }
@@ -2171,6 +2332,35 @@ final class EqualizerModel: ObservableObject {
         pollTimer = timer
     }
 
+    private func startCoreAudioDeviceObserver() {
+        audioService.observeDeviceChanges { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleAudioTopologyRefresh(retryCount: 3)
+            }
+        }
+    }
+
+    private func scheduleAudioTopologyRefresh(after delay: TimeInterval = 0.25, retryCount: Int = 0) {
+        audioDeviceRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            refreshAudioSources()
+            refreshAudioDevices(enforceLock: false)
+            if audioEngineRunState != .running && canStartAudioEngine {
+                lastAutoStartFailureSignature = nil
+                scheduleAutoStartIfNeeded()
+            }
+            if retryCount > 0,
+               autoStartEngineEnabled,
+               !manualStopSuppressesAutoStart,
+               audioEngineRunState != .running {
+                scheduleAudioTopologyRefresh(after: 1.0, retryCount: retryCount - 1)
+            }
+        }
+        audioDeviceRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     private func startLifecycleRefreshObservers() {
         let notifications: [(NotificationCenter, Notification.Name)] = [
             (NotificationCenter.default, NSApplication.didBecomeActiveNotification),
@@ -2216,6 +2406,7 @@ final class EqualizerModel: ObservableObject {
     private func refreshAudioEngineTelemetry() {
         let snapshot = audioEngine.telemetry
         audioEngineTelemetry = snapshot
+        monitorAudioEngineRenderProgress(snapshot)
         if abs(audioEngineSampleRate - snapshot.sampleRate) > 0.5 {
             audioEngineSampleRate = snapshot.sampleRate
         }
@@ -2228,6 +2419,58 @@ final class EqualizerModel: ObservableObject {
             smoothMeters: true,
             forceVisualRefresh: highFrameRateUIEnabled
         )
+    }
+
+    private func monitorAudioEngineRenderProgress(_ snapshot: AudioEngineTelemetry) {
+        guard audioEngineRunState == .running else {
+            lastRenderWatchdogSample = nil
+            return
+        }
+
+        guard !audioEngineConfiguration.renderTargets.isEmpty else {
+            lastRenderWatchdogSample = nil
+            return
+        }
+
+        let now = Date()
+        guard let previous = lastRenderWatchdogSample else {
+            lastRenderWatchdogSample = (snapshot.renderCallbacks, snapshot.renderedFrames, now)
+            return
+        }
+
+        if snapshot.renderCallbacks != previous.callbacks || snapshot.renderedFrames != previous.frames {
+            lastRenderWatchdogSample = (snapshot.renderCallbacks, snapshot.renderedFrames, now)
+            return
+        }
+
+        guard now.timeIntervalSince(previous.date) > 2.5 else {
+            return
+        }
+
+        lastRenderWatchdogSample = (snapshot.renderCallbacks, snapshot.renderedFrames, now)
+        scheduleAudioEngineRecoveryIfNeeded()
+    }
+
+    private func scheduleAudioEngineRecoveryIfNeeded() {
+        guard audioEngineRecoveryWorkItem == nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            audioEngineRecoveryWorkItem = nil
+            refreshAudioSources()
+            refreshAudioDevices(enforceLock: false)
+            if audioEngineRunState == .running {
+                lastAutoStartFailureSignature = nil
+                restartAudioEngineIfNeeded()
+            } else {
+                lastAutoStartFailureSignature = nil
+                scheduleAutoStartIfNeeded()
+            }
+        }
+        audioEngineRecoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
     }
 
     private var visualAnalyzerFrameRate: Double {
@@ -2660,6 +2903,60 @@ final class EqualizerModel: ObservableObject {
         return -peakBoost.clamped(to: 0...20)
     }
 
+    private func clippingStatus(
+        for targetBands: [EqualizerBand],
+        preamp: Double,
+        sampleRate: Double
+    ) -> EQClippingStatus {
+        let activeBands = targetBands.filter { band in
+            band.isEnabled && (abs(band.gain) > 0.01 || band.shape == .notch)
+        }
+        guard !activeBands.isEmpty else {
+            return EQClippingStatus(peakDecibels: preamp)
+        }
+
+        let responseBands = activeBands.compactMap { band -> PureQBiquadCoefficients? in
+            PureQBiquadMath.coefficients(
+                shape: band.shape,
+                sampleRate: sampleRate,
+                frequency: band.frequency,
+                q: band.q,
+                gain: band.gain
+            )
+        }
+        guard !responseBands.isEmpty else {
+            return EQClippingStatus(peakDecibels: preamp)
+        }
+
+        let minimumFrequency = 20.0
+        let maximumFrequency = 20_000.0
+        let sampleCount = 192
+        let minLog = log10(minimumFrequency)
+        let maxLog = log10(maximumFrequency)
+        var peakDecibels = preamp
+
+        for sampleIndex in 0..<sampleCount {
+            let fraction = Double(sampleIndex) / Double(sampleCount - 1)
+            let frequency = pow(10, minLog + ((maxLog - minLog) * fraction))
+            let omega = 2 * Double.pi * frequency / sampleRate.clamped(to: 8_000...384_000)
+            let cos1 = cos(omega)
+            let sin1 = sin(omega)
+            let cos2 = cos(2 * omega)
+            let sin2 = sin(2 * omega)
+            let bandDecibels = responseBands.reduce(0.0) { partialResult, coefficients in
+                partialResult + coefficients.magnitudeDecibels(
+                    cos1: cos1,
+                    sin1: sin1,
+                    cos2: cos2,
+                    sin2: sin2
+                )
+            }
+            peakDecibels = max(peakDecibels, preamp + bandDecibels)
+        }
+
+        return EQClippingStatus(peakDecibels: peakDecibels)
+    }
+
     private func estimatedResponseContribution(from band: EqualizerBand, at frequency: Double) -> Double {
         let octaveDistance = log2(frequency / band.frequency)
         let width = max(0.10, 1.05 / sqrt(max(0.12, band.q)))
@@ -2810,6 +3107,9 @@ final class EqualizerModel: ObservableObject {
             kind: .source,
             position: CGPoint(x: 145, y: 150),
             audioSourceID: AudioSourceItem.systemMixID,
+            sourceVolume: 1,
+            sourceMuted: false,
+            sourceSoloed: false,
             isProtected: true
         )
         let eq = RoutingNode(
@@ -2849,7 +3149,7 @@ final class EqualizerModel: ObservableObject {
             let sourceID = routingNodes[index].audioSourceID ?? AudioSourceItem.systemMixID
             if let source = availableAudioSources.first(where: { $0.id == sourceID }) {
                 setRoutingNodeTitleIfNeeded(at: index, title: source.title)
-                setRoutingNodeSubtitleIfNeeded(at: index, subtitle: source.subtitle)
+                setRoutingNodeSubtitleIfNeeded(at: index, subtitle: sourceSubtitle(for: source, node: routingNodes[index]))
             } else {
                 setRoutingNodeSubtitleIfNeeded(at: index, subtitle: "Source unavailable")
             }
@@ -2865,7 +3165,7 @@ final class EqualizerModel: ObservableObject {
                 let sourceID = routingNodes[index].audioSourceID ?? AudioSourceItem.systemMixID
                 if let source = availableAudioSources.first(where: { $0.id == sourceID }) {
                     setRoutingNodeTitleIfNeeded(at: index, title: source.title)
-                    setRoutingNodeSubtitleIfNeeded(at: index, subtitle: source.subtitle)
+                    setRoutingNodeSubtitleIfNeeded(at: index, subtitle: sourceSubtitle(for: source, node: routingNodes[index]))
                 } else {
                     setRoutingNodeSubtitleIfNeeded(at: index, subtitle: "Source unavailable")
                 }
@@ -2978,6 +3278,20 @@ final class EqualizerModel: ObservableObject {
             device.isMuted ? "Muted" : nil,
             "\(device.channelCount) ch"
         ].compactMap(\.self)
+        return labels.joined(separator: " / ")
+    }
+
+    private func sourceSubtitle(for source: AudioSourceItem, node: RoutingNode) -> String {
+        var labels: [String] = [source.subtitle]
+        if node.sourceMutedValue {
+            labels.append("Muted")
+        }
+        if node.sourceSoloedValue {
+            labels.append("Solo")
+        }
+        if abs(node.sourceVolumeValue - 1) > 0.005 {
+            labels.append("\(Int((node.sourceVolumeValue * 100).rounded()))%")
+        }
         return labels.joined(separator: " / ")
     }
 

@@ -330,6 +330,30 @@ enum TestReadinessState: Equatable {
     }
 }
 
+enum EQClippingRisk: Equatable {
+    case safe
+    case caution
+    case clipping
+}
+
+struct EQClippingStatus: Equatable {
+    let peakDecibels: Double
+
+    var risk: EQClippingRisk {
+        if peakDecibels > 0.05 { return .clipping }
+        if peakDecibels > -1.0 { return .caution }
+        return .safe
+    }
+
+    var headroomDecibels: Double {
+        max(0, -peakDecibels)
+    }
+
+    var clipAmountDecibels: Double {
+        max(0, peakDecibels)
+    }
+}
+
 struct TestReadinessItem: Identifiable {
     let id: String
     let title: String
@@ -345,6 +369,9 @@ struct RoutingNode: Identifiable, Equatable, Codable {
     var position: CGPoint
     var audioSourceID: String?
     var audioOutputUID: String?
+    var sourceVolume: Double?
+    var sourceMuted: Bool?
+    var sourceSoloed: Bool?
     var isProtected: Bool
     var eqMode: EqualizerMode
     var eqSelection: EqualizerSelection
@@ -367,6 +394,9 @@ struct RoutingNode: Identifiable, Equatable, Codable {
         position: CGPoint,
         audioSourceID: String? = nil,
         audioOutputUID: String? = nil,
+        sourceVolume: Double? = nil,
+        sourceMuted: Bool? = nil,
+        sourceSoloed: Bool? = nil,
         isProtected: Bool = false,
         eqMode: EqualizerMode = .expert,
         eqSelection: EqualizerSelection = .flat,
@@ -388,6 +418,9 @@ struct RoutingNode: Identifiable, Equatable, Codable {
         self.position = position
         self.audioSourceID = audioSourceID
         self.audioOutputUID = audioOutputUID
+        self.sourceVolume = sourceVolume
+        self.sourceMuted = sourceMuted
+        self.sourceSoloed = sourceSoloed
         self.isProtected = isProtected
         self.eqMode = eqMode
         self.eqSelection = eqSelection
@@ -401,6 +434,23 @@ struct RoutingNode: Identifiable, Equatable, Codable {
         self.eqManualBalance = eqManualBalance ?? eqBalance
         self.eqManualBands = eqManualBands ?? eqBands
         self.eqManualAutoGainEnabled = eqManualAutoGainEnabled ?? eqAutoGainEnabled
+    }
+}
+
+extension RoutingNode {
+    var sourceVolumeValue: Double {
+        get { (sourceVolume ?? 1).clamped(to: 0...2) }
+        set { sourceVolume = newValue.clamped(to: 0...2) }
+    }
+
+    var sourceMutedValue: Bool {
+        get { sourceMuted ?? false }
+        set { sourceMuted = newValue }
+    }
+
+    var sourceSoloedValue: Bool {
+        get { sourceSoloed ?? false }
+        set { sourceSoloed = newValue }
     }
 }
 

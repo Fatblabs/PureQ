@@ -62,7 +62,9 @@ private struct AudioOutputVolumeControl: Hashable {
 final class AudioOutputService {
     private let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
     private let volumeListenerQueue = DispatchQueue(label: "PureQ.AudioOutputService.volume")
+    private let deviceListenerQueue = DispatchQueue(label: "PureQ.AudioOutputService.devices")
     private var volumeListenerRegistrations: [AudioDeviceID: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)]] = [:]
+    private var deviceListenerRegistrations: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
 
     func snapshot() -> AudioOutputSnapshot {
         let defaultID = defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice)
@@ -242,6 +244,47 @@ final class AudioOutputService {
             var address = registration.address
             AudioObjectRemovePropertyListenerBlock(deviceID, &address, volumeListenerQueue, registration.block)
         }
+    }
+
+    func observeDeviceChanges(handler: @escaping @Sendable () -> Void) {
+        stopObservingDeviceChanges()
+
+        let block: AudioObjectPropertyListenerBlock = { _, _ in
+            handler()
+        }
+
+        let selectors: [AudioObjectPropertySelector] = [
+            kAudioHardwarePropertyDevices,
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioHardwarePropertyDefaultSystemOutputDevice
+        ]
+        var registrations: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
+
+        for selector in selectors {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectHasProperty(systemObjectID, &address) else { continue }
+            let status = AudioObjectAddPropertyListenerBlock(systemObjectID, &address, deviceListenerQueue, block)
+            if status == noErr {
+                registrations.append((address, block))
+            }
+        }
+
+        deviceListenerRegistrations = registrations
+    }
+
+    func stopObservingDeviceChanges() {
+        guard !deviceListenerRegistrations.isEmpty else {
+            return
+        }
+        for registration in deviceListenerRegistrations {
+            var address = registration.address
+            AudioObjectRemovePropertyListenerBlock(systemObjectID, &address, deviceListenerQueue, registration.block)
+        }
+        deviceListenerRegistrations.removeAll()
     }
 
     private func allDeviceIDs() -> [AudioDeviceID] {

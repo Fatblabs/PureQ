@@ -28,29 +28,52 @@ struct EqualizerGraphHost: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let graphSize = graphSize(for: proxy.size)
-            let contentWidth = graphSize.width + 58
+            let controlsHeight: CGFloat = 64
+            let graphSize = graphSize(for: CGSize(width: proxy.size.width, height: proxy.size.height - controlsHeight))
+            let contentWidth = graphSize.width
 
-            ScrollView(.horizontal, showsIndicators: contentWidth > proxy.size.width) {
-                HStack(alignment: .top, spacing: 10) {
-                    Spacer(minLength: 0)
-                    graph(size: graphSize)
-                    GraphToolToggles()
-                        .padding(.top, 2)
-                    Spacer(minLength: 0)
+            VStack(spacing: 8) {
+                graphHeader
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+
+                ScrollView(.horizontal, showsIndicators: contentWidth > proxy.size.width) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Spacer(minLength: 0)
+                        graph(size: graphSize)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minWidth: max(proxy.size.width, contentWidth + 24), alignment: .center)
                 }
-                .frame(minWidth: max(proxy.size.width, contentWidth + 24), alignment: .center)
-                .padding(.top, 10)
+                .scrollDisabled(contentWidth <= proxy.size.width)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .scrollDisabled(contentWidth <= proxy.size.width)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(
-            minHeight: max(245, 310 * CGFloat(model.graphHeightScale)),
-            idealHeight: max(310, 445 * CGFloat(model.graphHeightScale)),
-            maxHeight: max(360, 555 * CGFloat(model.graphHeightScale))
+            minHeight: max(300, 360 * CGFloat(model.graphHeightScale)),
+            idealHeight: max(360, 495 * CGFloat(model.graphHeightScale)),
+            maxHeight: max(410, 605 * CGFloat(model.graphHeightScale))
         )
         .background(Color.pureQBackground)
+    }
+
+    private var graphHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                GraphScaleControls()
+                Spacer(minLength: 10)
+                GraphToolToggles()
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                GraphScaleControls()
+                HStack {
+                    Spacer(minLength: 0)
+                    GraphToolToggles()
+                    Spacer(minLength: 0)
+                }
+            }
+        }
     }
 
     private func graph(size: CGSize) -> some View {
@@ -82,20 +105,13 @@ struct GraphToolToggles: View {
     @EnvironmentObject private var model: EqualizerModel
 
     var body: some View {
-        ViewThatFits(in: .vertical) {
-            VStack(spacing: 7) {
-                buttons
-            }
-
-            HStack(spacing: 7) {
-                buttons
-            }
+        HStack(spacing: 7) {
+            buttons
         }
     }
 
     @ViewBuilder
     private var buttons: some View {
-        GraphScaleButton()
         GraphToggleButton(
             isEnabled: $model.spectrumAnalyzerEnabled,
             title: "FFT",
@@ -117,39 +133,15 @@ struct GraphToolToggles: View {
     }
 }
 
-struct GraphScaleButton: View {
+struct GraphScaleControls: View {
     @EnvironmentObject private var model: EqualizerModel
-    @State private var showingPopover = false
 
     private var isCustomized: Bool {
         abs(model.graphWidthScale - 1) > 0.001 || abs(model.graphHeightScale - 1) > 0.001
     }
 
     var body: some View {
-        Button {
-            showingPopover.toggle()
-        } label: {
-            Label("Size", systemImage: "arrow.up.left.and.arrow.down.right")
-                .labelStyle(.iconOnly)
-                .frame(width: 34, height: 34)
-        }
-        .buttonStyle(IconButtonStyle(size: 34, active: isCustomized))
-        .help("Adjust graph size")
-        .popover(isPresented: $showingPopover, arrowEdge: .trailing) {
-            GraphScalePopover()
-                .environmentObject(model)
-        }
-    }
-}
-
-struct GraphScalePopover: View {
-    @EnvironmentObject private var model: EqualizerModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Graph Size")
-                .font(.headline.weight(.semibold))
-
+        HStack(spacing: 10) {
             GraphScaleSlider(
                 title: "Width",
                 value: Binding(
@@ -157,6 +149,7 @@ struct GraphScalePopover: View {
                     set: { model.setGraphWidthScale($0) }
                 )
             )
+            .frame(width: 172)
 
             GraphScaleSlider(
                 title: "Height",
@@ -165,15 +158,16 @@ struct GraphScalePopover: View {
                     set: { model.setGraphHeightScale($0) }
                 )
             )
+            .frame(width: 172)
 
-            Button("Reset") {
+            Button {
                 model.resetGraphScale()
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
             }
-            .buttonStyle(PillButtonStyle(active: false))
+            .buttonStyle(IconButtonStyle(size: 30, active: isCustomized))
+            .help("Reset graph size")
         }
-        .padding(14)
-        .frame(width: 250)
-        .background(Color.pureQBackground)
     }
 }
 

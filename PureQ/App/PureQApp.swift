@@ -101,7 +101,7 @@ final class PureQAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        PureQAppStore.model.flushPersistedState()
+        PureQAppStore.model.prepareForApplicationExit()
     }
 
     private func activateExistingInstanceAndQuitIfNeeded() -> Bool {

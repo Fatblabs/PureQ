@@ -26,12 +26,15 @@ Key goals:
 
 ## Quick Install (end users)
 
-Pre-built releases are the recommended way to use PureQ. Visit the Releases page and download the latest `.dmg`.
+Pre-built releases are the recommended way to use PureQ. Install PureQ from the `.pkg` installer in the Releases page. The installer places both the app and the bundled audio driver in the correct system locations.
 
 1. Open Releases: https://github.com/Fatblabs/PureQ/releases
-2. Download `PureQ.dmg` for your macOS version.
-3. Open the `.dmg` and drag the app into `/Applications`.
-4. On first launch you may need to allow the app in System Settings → Privacy & Security if Gatekeeper blocks it.
+2. Download the latest `PureQ-<version>.pkg`.
+3. Open the `.pkg` and follow the installer prompts.
+4. Launch PureQ from `/Applications`.
+5. If macOS blocks the test build, right-click the installer or app and choose Open, then confirm in System Settings → Privacy & Security if prompted.
+
+The `.pkg` installer is required for normal installs because PureQ includes a CoreAudio HAL driver. Dragging only `PureQ.app` into `/Applications` does not install the audio driver and can cause missing audio routing behavior.
 
 ---
 
@@ -51,13 +54,13 @@ cd PureQ
 open PureQ.xcodeproj
 ```
 
-If you need the virtual audio driver for loopback routing (used by some routing modes), run the included helper script to install the driver locally:
+For local development, the easiest app-and-driver install path is the project installer script:
 
 ```bash
-sudo ./Scripts/install-pureq-driver.sh
-# When done, restart coreaudiod if prompted:
-sudo killall coreaudiod
+./Scripts/install-pureq.sh
 ```
+
+This builds PureQ, installs `/Applications/PureQ.app`, installs `/Library/Audio/Plug-Ins/HAL/PureQ.driver`, and restarts CoreAudio.
 
 Notes for developers:
 
@@ -77,7 +80,8 @@ If you want to explore code paths mentioned in this README, start with:
 
 - [PureQ/](PureQ) — UI and app logic
 - [PureQDriver/](PureQDriver) — virtual device implementation
-- [Scripts/install-pureq-driver.sh](Scripts/install-pureq-driver.sh) — driver install helper
+- [Scripts/package-pureq.sh](Scripts/package-pureq.sh) — creates the release `.pkg`
+- [Scripts/install-pureq.sh](Scripts/install-pureq.sh) — local app-and-driver installer for development
 
 ---
 

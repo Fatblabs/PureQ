@@ -63,7 +63,58 @@ struct PreampRow: View {
             .toggleStyle(.checkbox)
             .font(.callout.weight(.semibold))
             .help("Automatically lower preamp to offset the largest enabled boost")
+
+            EQClippingIndicator(status: model.activeEQClippingStatus)
         }
+    }
+}
+
+struct EQClippingIndicator: View {
+    let status: EQClippingStatus
+
+    var body: some View {
+        Label(label, systemImage: systemImage)
+            .font(.caption.monospacedDigit().weight(.bold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(tint.opacity(0.38), lineWidth: 1)
+            )
+            .help(helpText)
+    }
+
+    private var label: String {
+        switch status.risk {
+        case .safe:
+            return String(format: "Headroom %.1fdB", status.headroomDecibels)
+        case .caution:
+            return String(format: "Near clip %.1fdB", status.peakDecibels)
+        case .clipping:
+            return String(format: "Clip +%.1fdB", status.clipAmountDecibels)
+        }
+    }
+
+    private var systemImage: String {
+        switch status.risk {
+        case .safe: return "checkmark.circle.fill"
+        case .caution: return "exclamationmark.triangle.fill"
+        case .clipping: return "waveform.path.badge.exclamationmark"
+        }
+    }
+
+    private var tint: Color {
+        switch status.risk {
+        case .safe: return Color.pureQGreen
+        case .caution: return Color.pureQAmber
+        case .clipping: return Color.pureQOrange
+        }
+    }
+
+    private var helpText: String {
+        "Estimated peak EQ gain after preamp. Positive values can clip full-scale audio."
     }
 }
 
@@ -505,26 +556,22 @@ struct VerticalFaderTrack: View {
     var body: some View {
         Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: true) { context, size in
             let centerX = size.width / 2
-            let usableHeight = max(size.height - 16, 1)
-            let trackRect = CGRect(x: centerX - 4, y: 0, width: 8, height: size.height)
+            let trackRect = CGRect(x: centerX - 4, y: 2, width: 8, height: max(size.height - 4, 1))
+            let usableHeight = max(trackRect.height, 1)
             context.fill(Path(roundedRect: trackRect, cornerRadius: 4), with: .color(Color.pureQControl))
             context.stroke(Path(roundedRect: trackRect, cornerRadius: 4), with: .color(.black.opacity(0.35)), lineWidth: 1)
 
-            for tick in 0..<13 {
-                let tickFraction = CGFloat(tick) / 12.0
-                let width: CGFloat = tick == 6 ? 28 : 20
-                let y = 8 + usableHeight * tickFraction
+            for tick in 0..<7 {
+                let tickFraction = CGFloat(tick) / 6.0
+                let isCenterTick = tick == 3
+                let width: CGFloat = isCenterTick ? 24 : 15
+                let opacity = isCenterTick ? 0.68 : 0.42
+                let y = trackRect.minY + usableHeight * tickFraction
                 let tickRect = CGRect(x: centerX - width / 2, y: y - 1, width: width, height: 2)
                 context.fill(
                     Path(roundedRect: tickRect, cornerRadius: 1),
-                    with: .color(Color.pureQGreen.opacity(tick == 6 ? 0.88 : 0.66))
+                    with: .color(Color.pureQGreen.opacity(opacity))
                 )
-            }
-
-            for guide in [0.25, 0.5, 0.75] {
-                let y = size.height * guide
-                let guideRect = CGRect(x: centerX - 14, y: y - 0.5, width: 28, height: 1)
-                context.fill(Path(roundedRect: guideRect, cornerRadius: 0.5), with: .color(.white.opacity(0.08)))
             }
 
             let meterFraction = CGFloat(activity.clamped(to: 0...1))
@@ -534,18 +581,18 @@ struct VerticalFaderTrack: View {
 
             let meterColor = activity > 0.84 ? Color.red : Color.pureQGreen
             let meterHeight = usableHeight * meterFraction
-            let meterRect = CGRect(x: centerX - 3, y: size.height - 8 - meterHeight, width: 6, height: meterHeight)
+            let meterRect = CGRect(x: centerX - 2.5, y: trackRect.maxY - meterHeight, width: 5, height: meterHeight)
             context.fill(
-                Path(roundedRect: meterRect, cornerRadius: 3),
-                with: .color(meterColor.opacity(isEnabled ? 0.48 : 0.14))
+                Path(roundedRect: meterRect, cornerRadius: 2.5),
+                with: .color(meterColor.opacity(isEnabled ? 0.46 : 0.14))
             )
 
             if meterFraction > 0.12 {
-                let markerY = size.height - 8 - usableHeight * meterFraction
-                let markerRect = CGRect(x: centerX + 4.5, y: markerY - 1.5, width: 9, height: 3)
+                let markerY = trackRect.maxY - meterHeight
+                let markerRect = CGRect(x: centerX + 4.5, y: markerY - 1.25, width: 8, height: 2.5)
                 context.fill(
-                    Path(roundedRect: markerRect, cornerRadius: 1.5),
-                    with: .color(meterColor.opacity(isEnabled ? 0.76 : 0.22))
+                    Path(roundedRect: markerRect, cornerRadius: 1.25),
+                    with: .color(meterColor.opacity(isEnabled ? 0.70 : 0.22))
                 )
             }
         }
@@ -622,4 +669,3 @@ struct QDial: View {
         onChange(newValue)
     }
 }
-

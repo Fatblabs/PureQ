@@ -68,6 +68,9 @@ struct AudioEngineSourceRoute: Equatable {
     let title: String
     let bundleIdentifier: String?
     let processIdentifier: pid_t?
+    let volume: Double
+    let isMuted: Bool
+    let isSoloed: Bool
     let reachesOutput: Bool
 }
 
@@ -82,6 +85,9 @@ struct AudioEngineRoutePlan: Equatable {
     let nodePath: [RoutingNode.ID]
     let eqNodeIDs: [RoutingNode.ID]
     let filters: [AudioEngineFilterDescriptor]
+    let sourceGainDecibels: Double
+    let isMuted: Bool
+    let isSoloed: Bool
     let preamp: Double
 }
 
@@ -102,6 +108,7 @@ struct AudioEngineConfiguration: Equatable {
     let preamp: Double
     let balance: Double
     let sourceRoutes: [AudioEngineSourceRoute]
+    let suppressionSourceRoutes: [AudioEngineSourceRoute]
     let routePlans: [AudioEngineRoutePlan]
     let renderTargets: [AudioEngineRenderTarget]
     let outputUID: String?
@@ -198,11 +205,23 @@ final class AudioEngineService {
         let hasSpecificSourceRoute = rawRoutePlans.contains { route in
             route.outputUID != nil && route.sourceID != AudioSourceItem.systemMixID
         }
-        let routePlans = hasSpecificSourceRoute
+        let soloedSourceNodeIDs = Set(nodes.compactMap { node -> RoutingNode.ID? in
+            guard node.kind == .source, node.sourceSoloedValue else { return nil }
+            return node.id
+        })
+        let routePlansBeforeMixControls = hasSpecificSourceRoute
             ? rawRoutePlans.filter { !protectedSystemSourceNodeIDs.contains($0.sourceNodeID) }
             : rawRoutePlans
+        let routePlans = routePlansBeforeMixControls.filter { route in
+            !route.isMuted && (soloedSourceNodeIDs.isEmpty || route.isSoloed)
+        }
+        let suppressedRoutePlans = routePlansBeforeMixControls.filter { route in
+            route.outputUID != nil &&
+            (route.isMuted || (!soloedSourceNodeIDs.isEmpty && !route.isSoloed))
+        }
         let routableRoutePlans = routePlans.filter { $0.outputUID != nil }
         let routedSourceNodeIDs = Set(routableRoutePlans.map(\.sourceNodeID))
+        let suppressedSourceNodeIDs = Set(suppressedRoutePlans.map(\.sourceNodeID))
         let renderTargets = makeRenderTargets(
             from: routableRoutePlans,
             nodeByID: nodeByID,
@@ -222,28 +241,37 @@ final class AudioEngineService {
         let routeFilters = effectiveEQNodes.flatMap { node in
             filterDescriptors(from: renderBands(for: node))
         }
+        let primarySourceGain = mixedSourceGainDecibels(for: primaryRoutePlans)
         let filters = Array((effectiveEQNodes.isEmpty ? fallbackFilters : routeFilters).prefix(96))
-        let effectivePreamp = effectiveEQNodes.isEmpty
+        let effectiveEQPreamp = effectiveEQNodes.isEmpty
             ? preamp
             : effectiveEQNodes.reduce(0) { partialResult, node in
                 partialResult + node.eqPreamp
             }.clamped(to: -24...24)
+        let effectivePreamp = (effectiveEQPreamp + primarySourceGain).clamped(to: -80...24)
         let effectiveBalance = (effectiveEQNodes.last?.eqBalance ?? balance).clamped(to: -1...1)
 
-        let sourceRoutes = nodes
-            .filter { $0.kind == .source }
-            .map { node in
-                let source = sources.first(where: { $0.id == node.audioSourceID })
-                let sourceID = node.audioSourceID ?? AudioSourceItem.systemMixID
-                return AudioEngineSourceRoute(
-                    sourceNodeID: node.id,
-                    sourceID: sourceID,
-                    title: source?.title ?? node.title,
-                    bundleIdentifier: source?.bundleIdentifier,
-                    processIdentifier: source?.processIdentifier,
-                    reachesOutput: routedSourceNodeIDs.contains(node.id)
-                )
-            }
+        let makeSourceRoutes: (Set<RoutingNode.ID>) -> [AudioEngineSourceRoute] = { reachingSourceNodeIDs in
+            nodes
+                .filter { $0.kind == .source }
+                .map { node in
+                    let source = sources.first(where: { $0.id == node.audioSourceID })
+                    let sourceID = node.audioSourceID ?? AudioSourceItem.systemMixID
+                    return AudioEngineSourceRoute(
+                        sourceNodeID: node.id,
+                        sourceID: sourceID,
+                        title: source?.title ?? node.title,
+                        bundleIdentifier: source?.bundleIdentifier,
+                        processIdentifier: source?.processIdentifier,
+                        volume: node.sourceVolumeValue,
+                        isMuted: node.sourceMutedValue,
+                        isSoloed: node.sourceSoloedValue,
+                        reachesOutput: reachingSourceNodeIDs.contains(node.id)
+                    )
+                }
+        }
+        let sourceRoutes = makeSourceRoutes(routedSourceNodeIDs)
+        let suppressionSourceRoutes = makeSourceRoutes(suppressedSourceNodeIDs)
 
         let prefersDriverCapture = virtualCaptureUID != nil &&
             sourceRoutes.contains { $0.reachesOutput && $0.sourceID == AudioSourceItem.systemMixID }
@@ -254,6 +282,7 @@ final class AudioEngineService {
             preamp: effectivePreamp,
             balance: effectiveBalance,
             sourceRoutes: sourceRoutes,
+            suppressionSourceRoutes: suppressionSourceRoutes,
             routePlans: routableRoutePlans,
             renderTargets: renderTargets,
             outputUID: primaryOutputUID,
@@ -275,6 +304,7 @@ final class AudioEngineService {
         let installed = installedDriverExists
         let bundled = bundledDriverExists
         let routedSources = configuration.sourceRoutes.filter(\.reachesOutput)
+        let suppressedSources = configuration.suppressionSourceRoutes.filter(\.reachesOutput)
 
         guard !configuration.sourceRoutes.isEmpty else {
             return AudioEngineStatus(
@@ -287,7 +317,7 @@ final class AudioEngineService {
             )
         }
 
-        guard !routedSources.isEmpty else {
+        guard !routedSources.isEmpty || !suppressedSources.isEmpty else {
             return AudioEngineStatus(
                 state: .blocked,
                 title: "No Route",
@@ -498,11 +528,13 @@ final class AudioEngineService {
                 let routeFilters = eqNodes.flatMap { node in
                     filterDescriptors(from: renderBands(for: node))
                 }
-                let routePreamp = eqNodes.isEmpty
+                let sourceGainDecibels = Self.decibels(forLinearGain: sourceNode.sourceVolumeValue)
+                let routeEQPreamp = eqNodes.isEmpty
                     ? 0
                     : eqNodes.reduce(0) { partialResult, node in
                         partialResult + node.eqPreamp
                     }.clamped(to: -24...24)
+                let routePreamp = (routeEQPreamp + sourceGainDecibels).clamped(to: -80...24)
 
                 return AudioEngineRoutePlan(
                     sourceNodeID: sourceNode.id,
@@ -515,6 +547,9 @@ final class AudioEngineService {
                     nodePath: path,
                     eqNodeIDs: eqNodes.map(\.id),
                     filters: routeFilters,
+                    sourceGainDecibels: sourceGainDecibels,
+                    isMuted: sourceNode.sourceMutedValue,
+                    isSoloed: sourceNode.sourceSoloedValue,
                     preamp: routePreamp
                 )
             }
@@ -542,11 +577,13 @@ final class AudioEngineService {
             let filters = effectiveEQNodes.flatMap { node in
                 filterDescriptors(from: renderBands(for: node))
             }
-            let preamp = effectiveEQNodes.isEmpty
+            let sourceGain = mixedSourceGainDecibels(for: plans)
+            let eqPreamp = effectiveEQNodes.isEmpty
                 ? fallbackPreamp
                 : effectiveEQNodes.reduce(0) { partialResult, node in
                     partialResult + node.eqPreamp
                 }.clamped(to: -24...24)
+            let preamp = (eqPreamp + sourceGain).clamped(to: -80...24)
             let balance = (effectiveEQNodes.last?.eqBalance ?? fallbackBalance).clamped(to: -1...1)
             let outputName = plans.first(where: { $0.outputUID == outputUID })?.outputName ?? "Output"
 
@@ -613,6 +650,19 @@ final class AudioEngineService {
 
     private func renderBands(for node: RoutingNode) -> [EqualizerBand] {
         node.eqBands
+    }
+
+    private static func decibels(forLinearGain gain: Double) -> Double {
+        guard gain > 0 else { return -80 }
+        return (20 * log10(gain.clamped(to: 0.0001...2))).clamped(to: -80...6.1)
+    }
+
+    private func mixedSourceGainDecibels(for routePlans: [AudioEngineRoutePlan]) -> Double {
+        guard !routePlans.isEmpty else { return 0 }
+        let linearGain = routePlans.reduce(0.0) { partialResult, route in
+            partialResult + pow(10, route.sourceGainDecibels / 20)
+        } / Double(routePlans.count)
+        return Self.decibels(forLinearGain: linearGain)
     }
 
     private func orderedUnique(_ ids: [RoutingNode.ID]) -> [RoutingNode.ID] {

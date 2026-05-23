@@ -149,7 +149,8 @@ final class PureQAudioEngineRunner {
         }
 
         let routedSources = configuration.sourceRoutes.filter(\.reachesOutput)
-        guard !routedSources.isEmpty else {
+        let suppressedSources = configuration.suppressionSourceRoutes.filter(\.reachesOutput)
+        guard !routedSources.isEmpty || !suppressedSources.isEmpty else {
             throw PureQAudioEngineError.noRoutedSources
         }
 
@@ -176,7 +177,17 @@ final class PureQAudioEngineRunner {
                 driverCapture = capture
                 startCapture = {}
             } else if #available(macOS 14.2, *) {
-                renderSampleRate = try prepareTapCapture(for: routedSources, mutesOriginalAudio: configuration.mutesOriginalAudio)
+                if routedSources.isEmpty {
+                    renderSampleRate = try prepareSilenceSuppressionTap(
+                        for: suppressedSources,
+                        mutesOriginalAudio: configuration.mutesOriginalAudio
+                    )
+                } else {
+                    renderSampleRate = try prepareTapCapture(
+                        for: routedSources,
+                        mutesOriginalAudio: configuration.mutesOriginalAudio
+                    )
+                }
                 startCapture = {
                     try self.startPreparedTapCapture()
                 }
@@ -462,16 +473,29 @@ final class PureQAudioEngineRunner {
     }
 
     @available(macOS 14.2, *)
-    private func startPreparedTapCapture() throws {
-        guard aggregateDeviceID != kAudioObjectUnknown, let ioProcID else {
-            throw PureQAudioEngineError.outputAudioUnitUnavailable
+    private func prepareSilenceSuppressionTap(
+        for suppressedSources: [AudioEngineSourceRoute],
+        mutesOriginalAudio: Bool
+    ) throws -> Double {
+        guard mutesOriginalAudio, !suppressedSources.isEmpty else {
+            throw PureQAudioEngineError.noRoutedSources
         }
 
+        try prepareSuppressionTap(description: try makeFullSuppressionTapDescription())
+        return nominalSampleRate(for: suppressionAggregateDeviceID) ?? 48_000
+    }
+
+    @available(macOS 14.2, *)
+    private func startPreparedTapCapture() throws {
         if let suppressionIOProcID, suppressionAggregateDeviceID != kAudioObjectUnknown {
             let suppressionStartStatus = AudioDeviceStart(suppressionAggregateDeviceID, suppressionIOProcID)
             guard suppressionStartStatus == noErr else {
                 throw PureQAudioEngineError.tapStartFailed(suppressionStartStatus)
             }
+        }
+
+        guard aggregateDeviceID != kAudioObjectUnknown, let ioProcID else {
+            return
         }
 
         let startStatus = AudioDeviceStart(aggregateDeviceID, ioProcID)
@@ -534,8 +558,13 @@ final class PureQAudioEngineRunner {
             return
         }
 
+        try prepareSuppressionTap(description: suppressionDescription)
+    }
+
+    @available(macOS 14.2, *)
+    private func prepareSuppressionTap(description: CATapDescription) throws {
         var createdTapID = AudioObjectID(kAudioObjectUnknown)
-        let tapStatus = AudioHardwareCreateProcessTap(suppressionDescription, &createdTapID)
+        let tapStatus = AudioHardwareCreateProcessTap(description, &createdTapID)
         guard tapStatus == noErr else {
             throw PureQAudioEngineError.tapCreationFailed(tapStatus)
         }
@@ -543,7 +572,7 @@ final class PureQAudioEngineRunner {
 
         var createdAggregateID = AudioObjectID(kAudioObjectUnknown)
         let subTapDescription: [String: Any] = [
-            kAudioSubTapUIDKey: suppressionDescription.uuid.uuidString,
+            kAudioSubTapUIDKey: description.uuid.uuidString,
             kAudioSubTapDriftCompensationKey: true,
             kAudioSubTapDriftCompensationQualityKey: kAudioAggregateDriftCompensationMediumQuality
         ]
@@ -571,6 +600,21 @@ final class PureQAudioEngineRunner {
             throw PureQAudioEngineError.ioProcCreationFailed(ioStatus)
         }
         suppressionIOProcID = createdIOProcID
+    }
+
+    @available(macOS 14.2, *)
+    private func makeFullSuppressionTapDescription() throws -> CATapDescription {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        guard let selfProcessObjectID = processObjectID(for: selfPID) else {
+            throw PureQAudioEngineError.processObjectLookupFailed(selfPID)
+        }
+
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [selfProcessObjectID])
+        description.name = "PureQ Source Suppression Tap"
+        description.uuid = UUID()
+        description.isPrivate = true
+        description.muteBehavior = CATapMuteBehavior.mutedWhenTapped
+        return description
     }
 
     @available(macOS 14.2, *)

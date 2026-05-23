@@ -25,8 +25,8 @@ struct RoutingWorkspace: View {
 }
 
 private enum RoutingNodeCardMetrics {
-    static let width: CGFloat = 214
-    static let height: CGFloat = 116
+    static let width: CGFloat = 226
+    static let height: CGFloat = 142
     static let halfWidth: CGFloat = width / 2
     static let halfHeight: CGFloat = height / 2
 }
@@ -361,6 +361,10 @@ struct EditableRoutingNodeCard: View {
                     .buttonStyle(MiniIconButtonStyle())
                     .help("Remove node")
                 }
+
+                if node.kind == .source {
+                    SourceNodeMixer(nodeID: node.id, compact: true)
+                }
             }
             .padding(11)
         }
@@ -457,6 +461,74 @@ struct EditableRoutingNodeCard: View {
     }
 }
 
+struct SourceNodeMixer: View {
+    @EnvironmentObject private var model: EqualizerModel
+    let nodeID: RoutingNode.ID
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: compact ? 6 : 8) {
+            Button {
+                model.toggleRoutingSourceMute(id: nodeID)
+            } label: {
+                Text("M")
+                    .font(.caption2.weight(.black))
+                    .frame(width: compact ? 24 : 30, height: compact ? 22 : 26)
+            }
+            .buttonStyle(SourceMixerButtonStyle(active: model.routingSourceMuted(id: nodeID), tint: Color.pureQOrange))
+            .help("Mute this source route")
+
+            Button {
+                model.toggleRoutingSourceSolo(id: nodeID)
+            } label: {
+                Text("S")
+                    .font(.caption2.weight(.black))
+                    .frame(width: compact ? 24 : 30, height: compact ? 22 : 26)
+            }
+            .buttonStyle(SourceMixerButtonStyle(active: model.routingSourceSoloed(id: nodeID), tint: Color.pureQAmber))
+            .help("Solo this source route")
+
+            Slider(
+                value: Binding(get: {
+                    model.routingSourceVolume(id: nodeID)
+                }, set: { value in
+                    model.setRoutingSourceVolume(id: nodeID, volume: value, persist: false)
+                }),
+                in: 0...2,
+                onEditingChanged: { editing in
+                    if !editing {
+                        model.commitRoutingSourceVolume(id: nodeID)
+                    }
+                }
+            )
+            .tint(Color.pureQGreen)
+            .frame(minWidth: compact ? 72 : 110)
+            .help("Source volume")
+
+            Text("\(Int((model.routingSourceVolume(id: nodeID) * 100).rounded()))%")
+                .font(.caption2.monospacedDigit().weight(.bold))
+                .foregroundStyle(.secondary)
+                .frame(width: compact ? 36 : 42, alignment: .trailing)
+        }
+    }
+}
+
+struct SourceMixerButtonStyle: ButtonStyle {
+    let active: Bool
+    let tint: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(active ? tint : .secondary)
+            .background(active ? tint.opacity(0.18) : .white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(active ? tint.opacity(0.58) : Color.pureQStroke, lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+    }
+}
+
 struct RoutingInspector: View {
     @EnvironmentObject private var model: EqualizerModel
 
@@ -495,6 +567,13 @@ struct RoutingInspector: View {
                                 ForEach(model.availableAudioSources) { source in
                                     Text(source.title).tag(source.id)
                                 }
+                            }
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Mixer")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(.secondary)
+                                SourceNodeMixer(nodeID: node.id)
                             }
                         }
                     }
@@ -655,4 +734,3 @@ struct RouteActionButtonStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
     }
 }
-
