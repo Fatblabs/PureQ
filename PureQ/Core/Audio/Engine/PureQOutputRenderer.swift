@@ -28,6 +28,9 @@ final class PureQOutputRenderer {
     private var lastStagedTarget: AudioEngineRenderTarget?
     private var lastStagedEnabled: Bool?
     private var lastStagedSampleRate: Double?
+    private var driverCaptureOutputGain: Float = 0
+    private var lastDriverCaptureOutputLeft: Float = 0
+    private var lastDriverCaptureOutputRight: Float = 0
 
     init(target: AudioEngineRenderTarget) {
         pendingConfiguration = PureQRendererConfiguration(
@@ -97,6 +100,9 @@ final class PureQOutputRenderer {
         lastStagedTarget = nil
         lastStagedEnabled = nil
         lastStagedSampleRate = nil
+        driverCaptureOutputGain = 0
+        lastDriverCaptureOutputLeft = 0
+        lastDriverCaptureOutputRight = 0
         ringBuffer.reset()
     }
 
@@ -290,6 +296,7 @@ final class PureQOutputRenderer {
 
         applyPendingConfigurationIfNeeded()
 
+        let usesDriverCapture = driverCaptureReader != nil
         let renderedFrameCount: UInt32
         if let driverCaptureReader {
             renderedFrameCount = driverCaptureReader.read(into: ioData, frameCount: frameCount)
@@ -308,6 +315,13 @@ final class PureQOutputRenderer {
         var metering = PureQRenderMetering.silent
         if renderedFrameCount > 0 {
             metering = renderState.process(ioData, frameCount: renderedFrameCount)
+        }
+        if usesDriverCapture {
+            applyDriverCaptureContinuity(
+                to: ioData,
+                renderedFrameCount: renderedFrameCount,
+                requestedFrameCount: frameCount
+            )
         }
 
         recordRender?(
@@ -328,6 +342,264 @@ final class PureQOutputRenderer {
             self.pendingConfiguration = nil
         }
         configurationLock.unlock()
+    }
+
+    private func applyDriverCaptureContinuity(
+        to ioData: UnsafeMutablePointer<AudioBufferList>,
+        renderedFrameCount: UInt32,
+        requestedFrameCount: UInt32
+    ) {
+        let buffers = UnsafeMutableAudioBufferListPointer(ioData)
+        let requestedFrames = Int(requestedFrameCount)
+        let renderedFrames = Int(min(renderedFrameCount, requestedFrameCount))
+        guard requestedFrames > 0, !buffers.isEmpty else {
+            return
+        }
+
+        if renderedFrames > 0 {
+            let previousLeft = lastDriverCaptureOutputLeft
+            let previousRight = lastDriverCaptureOutputRight
+            let renderedPeak = peakMagnitude(in: buffers, frameCount: renderedFrames)
+            if renderedPeak < 0.000_05,
+               driverCaptureOutputGain > 0.000_1 {
+                fadeDriverCaptureOutputToSilence(
+                    in: buffers,
+                    startFrame: 0,
+                    requestedFrames: requestedFrames,
+                    left: previousLeft,
+                    right: previousRight
+                )
+                return
+            }
+
+            if driverCaptureOutputGain < 0.999 {
+                let rampFrames = min(renderedFrames, driverCaptureDeClickFrameCount)
+                let startGain = driverCaptureOutputGain.clamped(to: 0...1)
+                for frame in 0..<rampFrames {
+                    let amount = Float(frame + 1) / Float(rampFrames)
+                    let gain = startGain + ((1 - startGain) * amount)
+                    scaleFrame(in: buffers, frame: frame, gain: gain)
+                }
+            }
+
+            let lastFrame = readFrame(from: buffers, frame: renderedFrames - 1)
+            lastDriverCaptureOutputLeft = lastFrame.left
+            lastDriverCaptureOutputRight = lastFrame.right
+            driverCaptureOutputGain = 1
+
+            if renderedFrames < requestedFrames {
+                fadeDriverCaptureOutputToSilence(
+                    in: buffers,
+                    startFrame: renderedFrames,
+                    requestedFrames: requestedFrames,
+                    left: lastFrame.left,
+                    right: lastFrame.right
+                )
+            } else {
+                updateByteSizes(buffers: buffers, frameCount: requestedFrames)
+            }
+            return
+        }
+
+        guard driverCaptureOutputGain > 0.000_1 ||
+              abs(lastDriverCaptureOutputLeft) > 0.000_01 ||
+              abs(lastDriverCaptureOutputRight) > 0.000_01 else {
+            updateByteSizes(buffers: buffers, frameCount: requestedFrames)
+            return
+        }
+
+        fadeDriverCaptureOutputToSilence(
+            in: buffers,
+            startFrame: 0,
+            requestedFrames: requestedFrames,
+            left: lastDriverCaptureOutputLeft,
+            right: lastDriverCaptureOutputRight
+        )
+    }
+
+    private var driverCaptureDeClickFrameCount: Int {
+        Int((renderState.sampleRate * 0.0015).clamped(to: 32...512))
+    }
+
+    private func fadeDriverCaptureOutputToSilence(
+        in buffers: UnsafeMutableAudioBufferListPointer,
+        startFrame: Int,
+        requestedFrames: Int,
+        left: Float,
+        right: Float
+    ) {
+        let availableFrames = max(0, requestedFrames - startFrame)
+        let fadeFrames = min(availableFrames, driverCaptureDeClickFrameCount)
+        if fadeFrames > 0 {
+            for offset in 0..<fadeFrames {
+                let amount = 1 - (Float(offset + 1) / Float(fadeFrames + 1))
+                writeFrame(
+                    left: left * amount,
+                    right: right * amount,
+                    into: buffers,
+                    frame: startFrame + offset
+                )
+            }
+        }
+        if startFrame + fadeFrames < requestedFrames {
+            zeroFrames(
+                in: buffers,
+                startFrame: startFrame + fadeFrames,
+                frameCount: requestedFrames - startFrame - fadeFrames
+            )
+        }
+        driverCaptureOutputGain = 0
+        lastDriverCaptureOutputLeft = 0
+        lastDriverCaptureOutputRight = 0
+        updateByteSizes(buffers: buffers, frameCount: requestedFrames)
+    }
+
+    private func readFrame(
+        from buffers: UnsafeMutableAudioBufferListPointer,
+        frame: Int
+    ) -> (left: Float, right: Float) {
+        if buffers.count == 1 {
+            let buffer = buffers[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                return (0, 0)
+            }
+            let channelCount = Int(max(buffer.mNumberChannels, 1))
+            let base = frame * channelCount
+            let left = data[base]
+            let right = channelCount > 1 ? data[base + 1] : left
+            return (left, right)
+        }
+
+        let left = buffers[0].mData?.assumingMemoryBound(to: Float.self)[frame] ?? 0
+        let right = buffers.count > 1
+            ? (buffers[1].mData?.assumingMemoryBound(to: Float.self)[frame] ?? left)
+            : left
+        return (left, right)
+    }
+
+    private func peakMagnitude(
+        in buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int
+    ) -> Float {
+        var peak: Float = 0
+        if buffers.count == 1 {
+            let buffer = buffers[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                return 0
+            }
+            let channelCount = Int(max(buffer.mNumberChannels, 1))
+            let sampleCount = frameCount * channelCount
+            for sampleIndex in 0..<sampleCount {
+                peak = max(peak, abs(data[sampleIndex]))
+            }
+            return peak
+        }
+
+        for bufferIndex in 0..<buffers.count {
+            guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
+                continue
+            }
+            for frame in 0..<frameCount {
+                peak = max(peak, abs(data[frame]))
+            }
+        }
+        return peak
+    }
+
+    private func writeFrame(
+        left: Float,
+        right: Float,
+        into buffers: UnsafeMutableAudioBufferListPointer,
+        frame: Int
+    ) {
+        if buffers.count == 1 {
+            let buffer = buffers[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                return
+            }
+            let channelCount = Int(max(buffer.mNumberChannels, 1))
+            let base = frame * channelCount
+            data[base] = left
+            if channelCount > 1 {
+                data[base + 1] = right
+            }
+            if channelCount > 2 {
+                for channel in 2..<channelCount {
+                    data[base + channel] = 0
+                }
+            }
+            return
+        }
+
+        if let leftData = buffers[0].mData?.assumingMemoryBound(to: Float.self) {
+            leftData[frame] = left
+        }
+        if buffers.count > 1 {
+            if let rightData = buffers[1].mData?.assumingMemoryBound(to: Float.self) {
+                rightData[frame] = right
+            }
+        }
+        if buffers.count > 2 {
+            for bufferIndex in 2..<buffers.count {
+                if let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) {
+                    data[frame] = 0
+                }
+            }
+        }
+    }
+
+    private func scaleFrame(
+        in buffers: UnsafeMutableAudioBufferListPointer,
+        frame: Int,
+        gain: Float
+    ) {
+        if buffers.count == 1 {
+            let buffer = buffers[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else {
+                return
+            }
+            let channelCount = Int(max(buffer.mNumberChannels, 1))
+            let base = frame * channelCount
+            for channel in 0..<channelCount {
+                data[base + channel] *= gain
+            }
+            return
+        }
+
+        for bufferIndex in 0..<buffers.count {
+            if let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) {
+                data[frame] *= gain
+            }
+        }
+    }
+
+    private func zeroFrames(
+        in buffers: UnsafeMutableAudioBufferListPointer,
+        startFrame: Int,
+        frameCount: Int
+    ) {
+        guard frameCount > 0 else { return }
+        for bufferIndex in 0..<buffers.count {
+            let channelCount = Int(max(buffers[bufferIndex].mNumberChannels, 1))
+            guard let data = buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else {
+                continue
+            }
+            memset(
+                UnsafeMutableRawPointer(data.advanced(by: startFrame * channelCount)),
+                0,
+                frameCount * channelCount * MemoryLayout<Float>.size
+            )
+        }
+    }
+
+    private func updateByteSizes(
+        buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int
+    ) {
+        for bufferIndex in 0..<buffers.count {
+            let channelCount = buffers[bufferIndex].mNumberChannels
+            buffers[bufferIndex].mDataByteSize = UInt32(frameCount) * channelCount * UInt32(MemoryLayout<Float>.size)
+        }
     }
 }
 

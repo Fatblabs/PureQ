@@ -880,16 +880,20 @@ final class PureQAudioEngineRunner {
     ) -> String? {
         let resolvedTarget = targetSampleRate.clamped(to: 8_000...768_000)
         var captureMismatches: [String] = []
-        if let nominalRate = nominalSampleRate(for: captureDeviceID),
-           !sampleRatesMatch(nominalRate, resolvedTarget) {
+        let nominalRate = nominalSampleRate(for: captureDeviceID)
+        let captureRate = effectiveSampleRate(for: captureDeviceID)
+        let streamRates = streamSampleRates(for: captureDeviceID)
+        let mismatchedStreamRates = streamRates.filter { !sampleRatesMatch($0, resolvedTarget) }
+        let captureRateMatches = captureRate.map { sampleRatesMatch($0, resolvedTarget) } ?? false
+        if let nominalRate,
+           !sampleRatesMatch(nominalRate, resolvedTarget),
+           !(captureRateMatches && mismatchedStreamRates.isEmpty) {
             captureMismatches.append("nominal \(sampleRateDescription(nominalRate))")
         }
-        if let captureRate = effectiveSampleRate(for: captureDeviceID),
+        if let captureRate,
            !sampleRatesMatch(captureRate, resolvedTarget) {
             captureMismatches.append("actual \(sampleRateDescription(captureRate))")
         }
-        let streamRates = streamSampleRates(for: captureDeviceID)
-        let mismatchedStreamRates = streamRates.filter { !sampleRatesMatch($0, resolvedTarget) }
         if !mismatchedStreamRates.isEmpty {
             captureMismatches.append("stream \(sampleRateListDescription(mismatchedStreamRates))")
         }

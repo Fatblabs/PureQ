@@ -152,7 +152,6 @@ final class EqualizerModel: ObservableObject {
     private var manualBands = EqualizerBand.makeStandardBands()
     private var manualAutoGainEnabled = true
     private var visibleGraphicalSurfaceIDs = Set<UUID>()
-    private var lastVirtualCaptureNominalSyncAttempt: (uid: String, sampleRate: Double, timestamp: Date)?
 
     var visibleBands: [EqualizerBand] {
         sortedBands(bands)
@@ -2818,17 +2817,12 @@ final class EqualizerModel: ObservableObject {
         audioFormatTransitionWorkItem?.cancel()
         audioFormatTransitionGeneration += 1
         let generation = audioFormatTransitionGeneration
-        let shouldResumeEngine = audioEngineRunState == .running ||
+        let wasRunning = audioEngineRunState == .running
+        let shouldResumeEngine = wasRunning ||
             audioFormatTransitionShouldResumeEngine ||
             (autoStartEngineEnabled && !manualStopSuppressesAutoStart && canStartAudioEngine)
 
-        if audioEngineRunState == .running {
-            audioFormatTransitionShouldResumeEngine = true
-            lastAutoStartFailureSignature = nil
-            isHandlingAudioFormatTransition = true
-            stopAudioEngine(manual: false)
-            isHandlingAudioFormatTransition = false
-        } else if shouldResumeEngine {
+        if !wasRunning, shouldResumeEngine {
             audioFormatTransitionShouldResumeEngine = true
             lastAutoStartFailureSignature = nil
         }
@@ -2840,16 +2834,27 @@ final class EqualizerModel: ObservableObject {
             self.refreshAudioDevices(enforceLock: false)
             self.isHandlingAudioFormatTransition = false
 
-            let shouldRestart = self.audioFormatTransitionShouldResumeEngine || shouldResumeEngine
+            if wasRunning {
+                self.audioFormatTransitionShouldResumeEngine = false
+                if self.audioEngineNeedsFormatRestart(for: self.audioEngineConfiguration) {
+                    self.lastAutoStartFailureSignature = nil
+                    self.restartAudioEngineIfNeeded()
+                } else {
+                    self.updateAudioEngineRendering(scheduleSave: false)
+                }
+                return
+            }
+
+            let shouldStart = self.audioFormatTransitionShouldResumeEngine || shouldResumeEngine
             self.audioFormatTransitionShouldResumeEngine = false
-            if shouldRestart, self.canStartAudioEngine {
+            if shouldStart, self.canStartAudioEngine {
                 self.lastAutoStartFailureSignature = nil
                 self.startAudioEngine(manual: false)
                 return
             }
 
             if retryCount > 0,
-               shouldRestart,
+               shouldStart,
                self.autoStartEngineEnabled,
                !self.manualStopSuppressesAutoStart {
                 self.scheduleAudioFormatTransitionRefresh(after: 0.85, retryCount: retryCount - 1)
@@ -2861,6 +2866,34 @@ final class EqualizerModel: ObservableObject {
         }
         audioFormatTransitionWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func audioEngineNeedsFormatRestart(for configuration: AudioEngineConfiguration) -> Bool {
+        guard audioEngineRunState == .running else {
+            return false
+        }
+
+        if let targetSampleRate = preferredVirtualCaptureSampleRate(for: configuration),
+           !sampleRatesMatch(audioEngineSampleRate, targetSampleRate) {
+            return true
+        }
+
+        for target in configuration.renderTargets {
+            guard let output = hardwareOutputDevices.first(where: { $0.uid == target.outputUID }) else {
+                return true
+            }
+            let outputSampleRate = audioService.actualSampleRate(uid: output.uid) ??
+                output.nominalSampleRate
+            if let outputSampleRate,
+               !sampleRatesMatch(audioEngineSampleRate, outputSampleRate) {
+                return true
+            }
+        }
+
+        return pureQVirtualOutputFormatMismatchDescription(
+            for: configuration,
+            includeNominalOnlyMismatch: false
+        ) != nil
     }
 
     private func scheduleVirtualCaptureFormatVerification(after delay: TimeInterval = 0.35) {
@@ -3228,27 +3261,21 @@ final class EqualizerModel: ObservableObject {
         if nominalSampleRateNeedsReset,
            actualSampleRateMatches,
            !actualSampleRateNeedsReset,
-           !streamSampleRatesNeedReset,
-           let lastAttempt = lastVirtualCaptureNominalSyncAttempt,
-           lastAttempt.uid == virtualOutput.uid,
-           sampleRatesMatch(lastAttempt.sampleRate, resolvedSampleRate),
-           Date().timeIntervalSince(lastAttempt.timestamp) < 4.0 {
+           !streamSampleRatesNeedReset {
             return false
         }
 
         if audioService.setNominalSampleRate(uid: virtualOutput.uid, sampleRate: resolvedSampleRate, includeHidden: true) {
-            lastVirtualCaptureNominalSyncAttempt = (
-                uid: virtualOutput.uid,
-                sampleRate: resolvedSampleRate,
-                timestamp: Date()
-            )
             scheduleVirtualCaptureFormatVerification(after: (actualSampleRateNeedsReset || streamSampleRatesNeedReset) ? 0.35 : 1.5)
             return actualSampleRateNeedsReset || actualSampleRate == nil || streamSampleRatesNeedReset
         }
         return false
     }
 
-    private func pureQVirtualOutputFormatMismatchDescription(for configuration: AudioEngineConfiguration? = nil) -> String? {
+    private func pureQVirtualOutputFormatMismatchDescription(
+        for configuration: AudioEngineConfiguration? = nil,
+        includeNominalOnlyMismatch: Bool = false
+    ) -> String? {
         guard let virtualOutput = pureQVirtualOutputDevice else {
             return nil
         }
@@ -3265,9 +3292,15 @@ final class EqualizerModel: ObservableObject {
 
         let resolvedSampleRate = targetSampleRate.clamped(to: 8_000...768_000)
         var mismatches: [String] = []
+        var nominalOnlyMismatch = false
         if let nominalSampleRate,
            !sampleRatesMatch(nominalSampleRate, resolvedSampleRate) {
-            mismatches.append("nominal \(sampleRateDescription(nominalSampleRate))")
+            let actualMatches = actualSampleRate.map { sampleRatesMatch($0, resolvedSampleRate) } ?? false
+            let streamsMatch = streamSampleRates.allSatisfy { sampleRatesMatch($0, resolvedSampleRate) }
+            nominalOnlyMismatch = actualMatches && streamsMatch
+            if includeNominalOnlyMismatch || !nominalOnlyMismatch {
+                mismatches.append("nominal \(sampleRateDescription(nominalSampleRate))")
+            }
         }
         if let actualSampleRate {
             if !sampleRatesMatch(actualSampleRate, resolvedSampleRate) {
