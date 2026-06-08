@@ -257,7 +257,7 @@ install_recovery_helper() {
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>10</integer>
+  <integer>60</integer>
 </dict>
 </plist>
 AGENT

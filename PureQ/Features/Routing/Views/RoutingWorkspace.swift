@@ -84,7 +84,7 @@ struct RoutingToolbar: View {
                     model.disconnectRoutingNode(id: id)
                 }
             } label: {
-                Image(systemName: "link.slash")
+                Image(systemName: "xmark.circle")
             }
             .buttonStyle(IconButtonStyle(size: 34))
             .disabled(model.selectedRoutingNodeID == nil)
@@ -332,7 +332,7 @@ struct EditableRoutingNodeCard: View {
                     Button {
                         model.disconnectRoutingNode(id: node.id)
                     } label: {
-                        Image(systemName: "link.slash")
+                        Image(systemName: "xmark.circle")
                     }
                     .buttonStyle(MiniIconButtonStyle())
                     .help("Disconnect node")
@@ -640,7 +640,7 @@ struct RoutingInspector: View {
                         Button {
                             model.disconnectRoutingNode(id: node.id)
                         } label: {
-                            Label("Disconnect", systemImage: "link.slash")
+                            Label("Disconnect", systemImage: "xmark.circle")
                         }
                         .buttonStyle(RouteActionButtonStyle(active: false))
                     }

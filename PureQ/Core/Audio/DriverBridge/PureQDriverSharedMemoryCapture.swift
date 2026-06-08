@@ -21,6 +21,7 @@ private enum PureQSharedAudioLayout {
     static let capacityFramesOffset = 8
     static let channelsOffset = 12
     static let frameCountOffset = 16
+    static let resetCounterOffset = 20
     static let writeCounterOffset = 24
     static let sampleRateOffset = 32
     static let sharedRingPathSelector = AudioObjectPropertySelector(0x7071_7370) // 'pqsp'
@@ -207,6 +208,7 @@ final class PureQDriverSharedMemoryCapture: @unchecked Sendable {
         address.storeUInt32(PureQSharedAudioLayout.capacityFrames, offset: PureQSharedAudioLayout.capacityFramesOffset)
         address.storeUInt32(PureQSharedAudioLayout.channelCount, offset: PureQSharedAudioLayout.channelsOffset)
         address.storeUInt32(0, offset: PureQSharedAudioLayout.frameCountOffset)
+        address.storeUInt32(0, offset: PureQSharedAudioLayout.resetCounterOffset)
         address.storeUInt64(0, offset: PureQSharedAudioLayout.writeCounterOffset)
         address.storeFloat64(48_000, offset: PureQSharedAudioLayout.sampleRateOffset)
         memset(address.advanced(by: PureQSharedAudioLayout.samplesOffset), 0, PureQSharedAudioLayout.totalSize - PureQSharedAudioLayout.samplesOffset)
@@ -228,6 +230,7 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
     private nonisolated(unsafe) var firstPoll = true
     private nonisolated(unsafe) var lastConsumedFrameCount: UInt32 = 0
     private nonisolated(unsafe) var overflowCount: UInt64 = 0
+    private nonisolated(unsafe) var lastResetCounter: UInt32 = 0
 
     init(capture: PureQDriverSharedMemoryCapture, mappedAddress: UnsafeMutableRawPointer, outputSampleRate: Double) {
         self.capture = capture
@@ -256,6 +259,7 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
         let capacity = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.capacityFramesOffset)
         let channels = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.channelsOffset)
         let lastFrameCount = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.frameCountOffset)
+        let resetCounter = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.resetCounterOffset)
         let writeCounter = mappedAddress.loadAtomicUInt64(offset: PureQSharedAudioLayout.writeCounterOffset)
 
         guard magic == PureQSharedAudioLayout.magic,
@@ -278,6 +282,14 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
 
         if firstPoll {
             firstPoll = false
+            lastResetCounter = resetCounter
+            readCounter = writeCounter
+            zeroFill(outputData, frameOffset: 0, frameCount: requestedFrames)
+            return 0
+        }
+
+        if resetCounter != lastResetCounter {
+            lastResetCounter = resetCounter
             readCounter = writeCounter
             zeroFill(outputData, frameOffset: 0, frameCount: requestedFrames)
             return 0
@@ -302,12 +314,13 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
             return 0
         }
 
-        let framesToRead = min(Int(availableFrames), requestedFrames)
+        let framesToRead = Int(min(availableFrames, UInt64(requestedFrames)))
         guard framesToRead > 0 else {
             zeroFill(outputData, frameOffset: 0, frameCount: requestedFrames)
             return 0
         }
 
+        let buffers = UnsafeMutableAudioBufferListPointer(outputData)
         let samples = mappedAddress
             .advanced(by: PureQSharedAudioLayout.samplesOffset)
             .assumingMemoryBound(to: Float.self)
@@ -319,7 +332,7 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
             let currentOffset = currentFrame * Int(channels)
             let left = sanitizedSample(samples[currentOffset])
             let right = sanitizedSample(samples[currentOffset + 1])
-            writeFrame(left: left, right: right, into: outputData, frame: frame)
+            writeFrame(left: left, right: right, into: buffers, frame: frame)
             localReadCounter &+= 1
         }
 
@@ -328,19 +341,18 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
         if framesToRead < requestedFrames {
             zeroFill(outputData, frameOffset: framesToRead, frameCount: requestedFrames - framesToRead)
         } else {
-            updateByteSizes(outputData, frameCount: requestedFrames)
+            updateByteSizes(outputData, frameCount: framesToRead)
         }
-        return UInt32(framesToRead)
+        return UInt32(framesToRead.clamped(to: 0...Int(UInt32.max)))
     }
 
     @inline(__always)
     private func writeFrame(
         left: Float,
         right: Float,
-        into outputData: UnsafeMutablePointer<AudioBufferList>,
+        into buffers: UnsafeMutableAudioBufferListPointer,
         frame: Int
     ) {
-        let buffers = UnsafeMutableAudioBufferListPointer(outputData)
         if buffers.count == 1 {
             guard let data = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
             let channelCount = Int(max(buffers[0].mNumberChannels, 1))

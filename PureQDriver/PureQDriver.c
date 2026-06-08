@@ -105,7 +105,7 @@ typedef struct PureQSharedAudioRing {
     atomic_uint capacityFrames;
     atomic_uint channels;
     atomic_uint frameCount;
-    UInt32 reserved0;
+    atomic_uint resetCounter;
     atomic_ullong writeCounter;
     Float64 sampleRate;
     UInt8 padding[24];
@@ -536,6 +536,7 @@ static void PureQLoopbackReset(void)
         memset(ring->samples, 0, kPureQLoopbackCapacityFrames * 2 * sizeof(Float32));
         atomic_store_explicit(&ring->frameCount, 0, memory_order_release);
         atomic_store_explicit(&ring->writeCounter, 0, memory_order_release);
+        atomic_fetch_add_explicit(&ring->resetCounter, 1, memory_order_release);
         ring->sampleRate = gSampleRate;
         gSharedRingWriteCounter = 0;
     }
@@ -557,8 +558,8 @@ static void PureQInitializeSharedRingHeader(void)
     atomic_store_explicit(&gSharedRing->capacityFrames, kPureQLoopbackCapacityFrames, memory_order_release);
     atomic_store_explicit(&gSharedRing->channels, 2, memory_order_release);
     atomic_store_explicit(&gSharedRing->frameCount, 0, memory_order_release);
+    atomic_store_explicit(&gSharedRing->resetCounter, 0, memory_order_release);
     atomic_store_explicit(&gSharedRing->writeCounter, 0, memory_order_release);
-    gSharedRing->reserved0 = 0;
     gSharedRing->sampleRate = gSampleRate;
     gSharedRingWriteCounter = 0;
 }
@@ -586,8 +587,7 @@ static Boolean PureQMapSharedRingPath(const char* path, Boolean createIfNeeded)
     }
 
     if (gSharedRing != NULL && strncmp(gSharedRingPath, path, sizeof(gSharedRingPath)) == 0) {
-        PureQInitializeSharedRingHeader();
-        memset(gSharedRing->samples, 0, kPureQLoopbackCapacityFrames * 2 * sizeof(Float32));
+        gSharedRing->sampleRate = gSampleRate;
         return true;
     }
 

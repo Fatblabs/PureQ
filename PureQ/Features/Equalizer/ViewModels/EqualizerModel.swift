@@ -136,6 +136,9 @@ final class EqualizerModel: ObservableObject {
     private var isHandlingAudioFormatTransition = false
     private var audioFormatTransitionGeneration = 0
     private var audioFormatTransitionShouldResumeEngine = false
+    private var missingRenderOutputObservedAt: Date?
+    private var pendingAudioFormatRestartSignature: String?
+    private var pendingAudioFormatRestartObservedAt: Date?
     private var lastKnownAudioFormatSignature = ""
     private var didPrepareForApplicationExit = false
     private var defaultOutputSwitchInFlight = false
@@ -1406,12 +1409,17 @@ final class EqualizerModel: ObservableObject {
         let nextSources = stableSources + runningOnlySources
         guard availableAudioSources != nextSources else { return }
         let wasRunning = audioEngineRunState == .running
-        let previousCaptureSignature = wasRunning ? sourceCaptureIdentitySignature(for: audioEngineConfiguration) : ""
+        let previousConfiguration = audioEngineConfiguration
+        let previousCaptureSignature = wasRunning ? sourceCaptureIdentitySignature(for: previousConfiguration) : ""
         availableAudioSources = nextSources
         syncRoutingSourceNodes()
         if wasRunning {
             let nextCaptureSignature = sourceCaptureIdentitySignature(for: audioEngineConfiguration)
             guard previousCaptureSignature != nextCaptureSignature else {
+                updateAudioEngineRendering(scheduleSave: false)
+                return
+            }
+            if previousConfiguration.prefersDriverCapture && audioEngineConfiguration.prefersDriverCapture {
                 updateAudioEngineRendering(scheduleSave: false)
                 return
             }
@@ -1575,7 +1583,10 @@ final class EqualizerModel: ObservableObject {
 
         syncRoutingOutputNodes()
         updatePureQVolumeBridge()
-        let virtualFormatChanged = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
+        let virtualFormatChanged = synchronizeVirtualCaptureFormatIfNeeded(
+            for: audioEngineConfiguration,
+            allowDeviceReconfiguration: !wasRunning
+        )
         let shouldHoldVirtualDefault = shouldHoldPureQVirtualOutputAsDefault
         let correctedVirtualDefault = shouldHoldVirtualDefault &&
             requestPureQVirtualOutputAsDefaultIfNeeded(refreshAfterChange: false)
@@ -1584,24 +1595,30 @@ final class EqualizerModel: ObservableObject {
             let configuration = audioEngineConfiguration
             let resolvedOutputCount = resolvedOutputDeviceIDs(for: configuration).count
             if resolvedOutputCount != configuration.renderTargets.count {
+                if deferTransientMissingRenderOutputStop() {
+                    return
+                }
                 stopAudioEngine(manual: false)
                 if !isHandlingAudioFormatTransition {
                     scheduleAutoStartIfNeeded()
                 }
                 return
             }
+            missingRenderOutputObservedAt = nil
 
-            if virtualFormatChanged ||
+            let observedDeviceStateChanged = virtualFormatChanged ||
                 devicesChanged ||
                 ((outputDefaultChanged || systemOutputDefaultChanged) && !correctedVirtualDefault) ||
-                previousTakeoverActive != audioEngineTakeoverActive {
+                previousTakeoverActive != audioEngineTakeoverActive
+            if observedDeviceStateChanged {
                 lastAutoStartFailureSignature = nil
                 if !isHandlingAudioFormatTransition {
-                    restartAudioEngineIfNeeded()
+                    handleRunningAudioFormatChange(for: configuration)
                 }
                 return
             }
 
+            resetPendingAudioFormatRestart()
             updateAudioEngineRendering(scheduleSave: false)
         } else if shouldHoldVirtualDefault {
             if devicesChanged || outputDefaultChanged || systemOutputDefaultChanged {
@@ -1737,7 +1754,6 @@ final class EqualizerModel: ObservableObject {
         let virtualCapture = virtualCaptureDeviceForEngine
         let shouldDeferVirtualSwitch = virtualCapture != nil && configuration.prefersDriverCapture
         var switchedDefaultToVirtual = false
-        var didStartRendering = false
         let outputDeviceIDs = resolvedOutputDeviceIDs(for: configuration)
         do {
             _ = synchronizeVirtualCaptureFormatIfNeeded(for: configuration)
@@ -1752,22 +1768,19 @@ final class EqualizerModel: ObservableObject {
                 outputDeviceIDsByUID: outputDeviceIDs,
                 captureDeviceID: virtualCapture?.audioObjectID
             )
-            didStartRendering = true
             if shouldDeferVirtualSwitch {
-                switchedDefaultToVirtual = try ensureSystemDefaultForVirtualCapture()
+                requestPureQVirtualOutputAsDefaultIfNeeded(refreshAfterChange: false)
             }
             normalizeRoutedHardwareOutputVolumes(for: configuration)
             lastAutoStartFailureSignature = nil
             audioEngineCapturedSourceNodeIDs = capturedSourceNodeIDs(in: configuration)
             resetOutputClippingTelemetry()
+            resetPendingAudioFormatRestart()
             setAudioEngineRunState(audioEngine.runState)
             lastRenderWatchdogSample = nil
             refreshAudioEngineTelemetry()
             startEngineTelemetryPolling()
         } catch {
-            if didStartRendering {
-                audioEngine.stopRendering()
-            }
             if switchedDefaultToVirtual {
                 restoreSystemDefaultAfterVirtualCapture()
             }
@@ -1788,6 +1801,7 @@ final class EqualizerModel: ObservableObject {
         }
         audioEngine.stopRendering()
         audioEngineCapturedSourceNodeIDs.removeAll()
+        resetPendingAudioFormatRestart()
         restoreNormalizedHardwareOutputVolumes()
         setAudioEngineRunState(audioEngine.runState)
         lastRenderWatchdogSample = nil
@@ -1992,8 +2006,24 @@ final class EqualizerModel: ObservableObject {
         return deviceIDsByUID
     }
 
+    private func deferTransientMissingRenderOutputStop() -> Bool {
+        guard audioEngineRunState == .running else { return false }
+
+        let now = Date()
+        if let firstObservedAt = missingRenderOutputObservedAt {
+            if now.timeIntervalSince(firstObservedAt) >= 1.5 {
+                missingRenderOutputObservedAt = nil
+                return false
+            }
+        } else {
+            missingRenderOutputObservedAt = now
+        }
+
+        scheduleAudioTopologyRefresh(after: 0.35, retryCount: 2)
+        return true
+    }
+
     private func restartAudioEngineIfNeeded() {
-        _ = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
         guard audioEngineRunState == .running else {
             scheduleAutoStartIfNeeded()
             return
@@ -2836,12 +2866,10 @@ final class EqualizerModel: ObservableObject {
 
             if wasRunning {
                 self.audioFormatTransitionShouldResumeEngine = false
-                if self.audioEngineNeedsFormatRestart(for: self.audioEngineConfiguration) {
-                    self.lastAutoStartFailureSignature = nil
-                    self.restartAudioEngineIfNeeded()
-                } else {
-                    self.updateAudioEngineRendering(scheduleSave: false)
-                }
+                self.handleRunningAudioFormatChange(
+                    for: self.audioEngineConfiguration,
+                    retryCount: retryCount
+                )
                 return
             }
 
@@ -2869,31 +2897,93 @@ final class EqualizerModel: ObservableObject {
     }
 
     private func audioEngineNeedsFormatRestart(for configuration: AudioEngineConfiguration) -> Bool {
-        guard audioEngineRunState == .running else {
-            return false
+        audioEngineFormatRestartSignature(for: configuration) != nil
+    }
+
+    private func handleRunningAudioFormatChange(
+        for configuration: AudioEngineConfiguration,
+        retryCount: Int = 2
+    ) {
+        guard let restartSignature = audioEngineFormatRestartSignature(for: configuration) else {
+            resetPendingAudioFormatRestart()
+            updateAudioEngineRendering(scheduleSave: false)
+            return
         }
 
+        let now = Date()
+        let debounceInterval = 0.85
+        if pendingAudioFormatRestartSignature == restartSignature,
+           let observedAt = pendingAudioFormatRestartObservedAt,
+           now.timeIntervalSince(observedAt) >= debounceInterval {
+            resetPendingAudioFormatRestart()
+            lastAutoStartFailureSignature = nil
+            restartAudioEngineIfNeeded()
+            return
+        }
+
+        if pendingAudioFormatRestartSignature != restartSignature {
+            pendingAudioFormatRestartSignature = restartSignature
+            pendingAudioFormatRestartObservedAt = now
+        } else if pendingAudioFormatRestartObservedAt == nil {
+            pendingAudioFormatRestartObservedAt = now
+        }
+
+        updateAudioEngineRendering(scheduleSave: false)
+        let observedAt = pendingAudioFormatRestartObservedAt ?? now
+        let elapsed = now.timeIntervalSince(observedAt)
+        let nextDelay = max(0.25, debounceInterval - elapsed)
+        scheduleAudioFormatTransitionRefresh(after: nextDelay, retryCount: retryCount)
+    }
+
+    private func resetPendingAudioFormatRestart() {
+        pendingAudioFormatRestartSignature = nil
+        pendingAudioFormatRestartObservedAt = nil
+    }
+
+    private func audioEngineFormatRestartSignature(for configuration: AudioEngineConfiguration) -> String? {
+        guard audioEngineRunState == .running else {
+            return nil
+        }
+
+        let engineSampleRate = audioEngine.telemetry.sampleRate
+        if abs(audioEngineSampleRate - engineSampleRate) > 0.5 {
+            audioEngineSampleRate = engineSampleRate
+        }
+
+        var restartReasons: [String] = []
         if let targetSampleRate = preferredVirtualCaptureSampleRate(for: configuration),
-           !sampleRatesMatch(audioEngineSampleRate, targetSampleRate) {
-            return true
+           !sampleRatesMatch(engineSampleRate, targetSampleRate) {
+            restartReasons.append(
+                "engine:\(sampleRateDescription(engineSampleRate))->virtual:\(sampleRateDescription(targetSampleRate))"
+            )
         }
 
         for target in configuration.renderTargets {
             guard let output = hardwareOutputDevices.first(where: { $0.uid == target.outputUID }) else {
-                return true
+                restartReasons.append("missing-output:\(target.outputUID)")
+                continue
             }
             let outputSampleRate = audioService.actualSampleRate(uid: output.uid) ??
                 output.nominalSampleRate
             if let outputSampleRate,
-               !sampleRatesMatch(audioEngineSampleRate, outputSampleRate) {
-                return true
+               !sampleRatesMatch(engineSampleRate, outputSampleRate) {
+                restartReasons.append(
+                    "engine:\(sampleRateDescription(engineSampleRate))->output:\(output.uid):\(sampleRateDescription(outputSampleRate))"
+                )
             }
         }
 
-        return pureQVirtualOutputFormatMismatchDescription(
+        if let virtualMismatch = pureQVirtualOutputFormatMismatchDescription(
             for: configuration,
             includeNominalOnlyMismatch: false
-        ) != nil
+        ) {
+            restartReasons.append("virtual:\(virtualMismatch)")
+        }
+
+        guard !restartReasons.isEmpty else {
+            return nil
+        }
+        return restartReasons.sorted().joined(separator: "|")
     }
 
     private func scheduleVirtualCaptureFormatVerification(after delay: TimeInterval = 0.35) {
@@ -3105,7 +3195,10 @@ final class EqualizerModel: ObservableObject {
             return false
         }
 
-        _ = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
+        _ = synchronizeVirtualCaptureFormatIfNeeded(
+            for: audioEngineConfiguration,
+            allowDeviceReconfiguration: audioEngineRunState != .running
+        )
 
         guard outputDefaultsNeedChanging(to: virtualOutput.uid) else {
             return true
@@ -3196,12 +3289,19 @@ final class EqualizerModel: ObservableObject {
     }
 
     @discardableResult
-    private func synchronizeVirtualCaptureFormatIfNeeded(for configuration: AudioEngineConfiguration) -> Bool {
+    private func synchronizeVirtualCaptureFormatIfNeeded(
+        for configuration: AudioEngineConfiguration,
+        allowDeviceReconfiguration: Bool = true
+    ) -> Bool {
         guard let virtualOutput = pureQVirtualOutputDevice else {
             return false
         }
 
         let identityChanged = synchronizeVirtualCaptureIdentity(virtualOutput, for: configuration)
+        guard allowDeviceReconfiguration else {
+            return identityChanged
+        }
+
         let rateChanged = synchronizeVirtualCaptureSampleRate(virtualOutput, for: configuration)
         let bufferChanged = synchronizeAudioBufferFrameSizes(for: configuration, virtualCapture: virtualOutput)
         return identityChanged || rateChanged || bufferChanged
@@ -3253,15 +3353,7 @@ final class EqualizerModel: ObservableObject {
         let nominalSampleRateNeedsReset = !sampleRatesMatch(nominalSampleRate, resolvedSampleRate)
         let actualSampleRateNeedsReset = actualSampleRate.map { !sampleRatesMatch($0, resolvedSampleRate) } ?? false
         let streamSampleRatesNeedReset = streamSampleRates.contains { !sampleRatesMatch($0, resolvedSampleRate) }
-        let actualSampleRateMatches = actualSampleRate.map { sampleRatesMatch($0, resolvedSampleRate) } ?? false
         guard nominalSampleRateNeedsReset || actualSampleRateNeedsReset || streamSampleRatesNeedReset else {
-            return false
-        }
-
-        if nominalSampleRateNeedsReset,
-           actualSampleRateMatches,
-           !actualSampleRateNeedsReset,
-           !streamSampleRatesNeedReset {
             return false
         }
 

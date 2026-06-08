@@ -155,7 +155,7 @@ cat > "$PACKAGE_ROOT/Library/LaunchAgents/Sean-s-Apps.PureQ.AudioRecovery.plist"
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>10</integer>
+  <integer>60</integer>
 </dict>
 </plist>
 RECOVERY_LAUNCH_AGENT
