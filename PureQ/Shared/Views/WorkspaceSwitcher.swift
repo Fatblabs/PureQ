@@ -17,7 +17,7 @@ struct WorkspaceSwitcher: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 284)
+            .frame(width: 376)
 
             Spacer()
         }
@@ -26,4 +26,3 @@ struct WorkspaceSwitcher: View {
         .background(Color(red: 0.10, green: 0.11, blue: 0.13))
     }
 }
-

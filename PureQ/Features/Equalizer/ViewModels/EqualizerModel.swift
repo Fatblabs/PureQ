@@ -18,6 +18,11 @@ final class EqualizerModel: ObservableObject {
 
     @Published var powerEnabled = true {
         didSet {
+            if powerEnabled {
+                requestPureQVirtualOutputAsDefaultIfNeeded()
+            } else {
+                restoreSystemDefaultAfterVirtualCapture()
+            }
             updateAudioEngineRendering()
         }
     }
@@ -26,7 +31,7 @@ final class EqualizerModel: ObservableObject {
     @Published var preamp: Double = 0
     @Published var balance: Double = 0
     @Published var autoGainEnabled = true
-    @Published var highFrameRateUIEnabled = true {
+    @Published var highFrameRateUIEnabled = false {
         didSet {
             if audioEngineRunState == .running {
                 startEngineTelemetryPolling()
@@ -57,6 +62,7 @@ final class EqualizerModel: ObservableObject {
         }
     }
     @Published var graphBandEditingEnabled = false
+    @Published var debugModeEnabled = false
     @Published private(set) var graphWidthScale = EqualizerModel.persistedGraphScale(forKey: graphWidthScaleKey)
     @Published private(set) var graphHeightScale = EqualizerModel.persistedGraphScale(forKey: graphHeightScaleKey)
     @Published var autoStartEngineEnabled = true {
@@ -87,6 +93,7 @@ final class EqualizerModel: ObservableObject {
     @Published private(set) var driverInstallMessage: String?
     @Published private(set) var canUndoActiveScope = false
     private(set) var audioEngineTelemetry: AudioEngineTelemetry = .empty
+    @Published private(set) var outputClippingStatus: OutputClippingStatus = .empty
     @Published private(set) var audioEngineSampleRate: Double = 48_000
     @Published private(set) var pureQSystemVolume: Float = 1
     @Published private(set) var pureQSystemMuted = false
@@ -94,11 +101,16 @@ final class EqualizerModel: ObservableObject {
     private let audioService = AudioOutputService()
     private let audioEngine = AudioEngineService()
     private let persistenceQueue = DispatchQueue(label: "PureQ.Persistence", qos: .utility)
+    private let defaultOutputSwitchQueue = DispatchQueue(label: "PureQ.AudioOutput.DefaultSwitch", qos: .utility)
     private var pollTimer: Timer?
     private var engineTelemetryTimer: Timer?
     private var autoStartWorkItem: DispatchWorkItem?
     private var audioDeviceRefreshWorkItem: DispatchWorkItem?
+    private var audioFormatTransitionWorkItem: DispatchWorkItem?
+    private var virtualCaptureFormatVerificationWorkItem: DispatchWorkItem?
     private var audioEngineRecoveryWorkItem: DispatchWorkItem?
+    private var driverPostInstallRefreshWorkItem: DispatchWorkItem?
+    private var driverPostInstallRefreshGeneration = 0
     private var persistenceWorkItem: DispatchWorkItem?
     private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var persistenceSaveToken: UUID?
@@ -115,9 +127,23 @@ final class EqualizerModel: ObservableObject {
     private var routingContinuousUndoResetWorkItems: [String: DispatchWorkItem] = [:]
     private var lastAutoStartFailureSignature: String?
     private var lastRenderWatchdogSample: (callbacks: UInt64, frames: UInt64, date: Date)?
+    private var lastTelemetryClippedSampleCount: UInt64 = 0
+    private var lastTelemetryClipEventCount: UInt64 = 0
+    private var outputClipHoldUntil = Date.distantPast
+    private var lastOutputClippingStatusPublishTime = 0.0
+    private var audioEngineCapturedSourceNodeIDs = Set<RoutingNode.ID>()
     private var isStartingAudioEngine = false
+    private var isHandlingAudioFormatTransition = false
+    private var audioFormatTransitionGeneration = 0
+    private var audioFormatTransitionShouldResumeEngine = false
+    private var lastKnownAudioFormatSignature = ""
+    private var didPrepareForApplicationExit = false
+    private var defaultOutputSwitchInFlight = false
+    private var pendingDefaultOutputSwitchUID: String?
+    private var pendingDefaultOutputSwitchRefreshAfterChange = false
     private var manualStopSuppressesAutoStart = false
     private var preVirtualDefaultOutputUID: String?
+    private var lastAudioRecoveryOutputUID: String?
     private var normalizedHardwareOutputVolumeStates: [String: AudioOutputVolumeState] = [:]
     private var observedPureQVolumeDeviceID: AudioDeviceID?
     private var manualMode: EqualizerMode = .expert
@@ -126,6 +152,7 @@ final class EqualizerModel: ObservableObject {
     private var manualBands = EqualizerBand.makeStandardBands()
     private var manualAutoGainEnabled = true
     private var visibleGraphicalSurfaceIDs = Set<UUID>()
+    private var lastVirtualCaptureNominalSyncAttempt: (uid: String, sampleRate: Double, timestamp: Date)?
 
     var visibleBands: [EqualizerBand] {
         sortedBands(bands)
@@ -305,11 +332,13 @@ final class EqualizerModel: ObservableObject {
     }
 
     init() {
+        revealPureQVirtualOutputIfAvailable()
         refreshAudioSources()
         refreshAudioDevices(enforceLock: false)
         if !restorePersistedSessionIfAvailable() {
             seedRoutingGraphIfNeeded()
         }
+        refreshAudioDevices(enforceLock: false)
         startDevicePolling()
         startCoreAudioDeviceObserver()
         startLifecycleRefreshObservers()
@@ -321,14 +350,30 @@ final class EqualizerModel: ObservableObject {
     }
 
     func prepareForApplicationExit() {
+        guard !didPrepareForApplicationExit else { return }
+        didPrepareForApplicationExit = true
+
+        let preferredExitOutputUID = preferredApplicationExitOutputUID()
+
         autoStartWorkItem?.cancel()
         autoStartWorkItem = nil
         audioDeviceRefreshWorkItem?.cancel()
         audioDeviceRefreshWorkItem = nil
+        audioFormatTransitionWorkItem?.cancel()
+        audioFormatTransitionWorkItem = nil
+        virtualCaptureFormatVerificationWorkItem?.cancel()
+        virtualCaptureFormatVerificationWorkItem = nil
+        audioFormatTransitionGeneration += 1
+        audioFormatTransitionShouldResumeEngine = false
+        isHandlingAudioFormatTransition = false
         audioEngineRecoveryWorkItem?.cancel()
         audioEngineRecoveryWorkItem = nil
+        driverPostInstallRefreshWorkItem?.cancel()
+        driverPostInstallRefreshWorkItem = nil
+        driverPostInstallRefreshGeneration += 1
 
         stopAudioEngine(manual: true)
+        restorePreferredOutputForApplicationExit(preferredUID: preferredExitOutputUID)
 
         pollTimer?.invalidate()
         pollTimer = nil
@@ -352,6 +397,8 @@ final class EqualizerModel: ObservableObject {
             center.removeObserver(observer)
         }
         lifecycleObservers.removeAll()
+
+        hidePureQVirtualOutputForApplicationExit()
 
         flushPersistedState()
     }
@@ -441,6 +488,53 @@ final class EqualizerModel: ObservableObject {
         } else if visibleGraphicalSurfaceIDs.isEmpty {
             telemetryStore.reset()
         }
+    }
+
+    func makeDebugReport() -> String {
+        let configuration = audioEngineConfiguration
+        return PureQDiagnosticsReportBuilder.makeReport(
+            generatedAt: Date(),
+            powerEnabled: powerEnabled,
+            debugModeEnabled: debugModeEnabled,
+            highFrameRateUIEnabled: highFrameRateUIEnabled,
+            spectrumAnalyzerEnabled: spectrumAnalyzerEnabled,
+            soundIndicatorsEnabled: soundIndicatorsEnabled,
+            graphBandEditingEnabled: graphBandEditingEnabled,
+            graphWidthScale: graphWidthScale,
+            graphHeightScale: graphHeightScale,
+            activeEQTitle: activeEQTitle,
+            activeEQMode: activeEQMode,
+            activeEQSelection: activeEQSelection,
+            activeEQBandLayout: activeEQBandLayout,
+            activeEQPreamp: activeEQPreamp,
+            activeEQBalance: activeEQBalance,
+            activeEQAutoGainEnabled: activeEQAutoGainEnabled,
+            activeEQClippingStatus: activeEQClippingStatus,
+            activeEQBands: activeEQGraphBands,
+            audioEngineRunState: audioEngineRunState,
+            audioEngineStatus: audioEngine.evaluate(configuration),
+            audioEngineConfiguration: configuration,
+            audioEngineTelemetry: audioEngineTelemetry,
+            outputClippingStatus: outputClippingStatus,
+            outputDevices: outputDevices,
+            outputDiagnostics: audioService.diagnosticDevices(includeHiddenPureQ: true),
+            defaultOutputUID: defaultOutputUID,
+            defaultSystemOutputUID: defaultSystemOutputUID,
+            availableAudioSources: availableAudioSources,
+            routingNodes: routingNodes,
+            routingConnections: routingConnections,
+            selectedRoutingNodeID: selectedRoutingNodeID,
+            activeEQNodeID: activeEQNodeID,
+            readinessItems: readinessItems,
+            readinessSummary: readinessSummary,
+            driverInstallInProgress: driverInstallInProgress,
+            driverInstallMessage: driverInstallMessage,
+            autoStartEngineEnabled: autoStartEngineEnabled,
+            pureQSystemVolume: pureQSystemVolume,
+            pureQSystemMuted: pureQSystemMuted,
+            capturedSourceNodeIDs: audioEngineCapturedSourceNodeIDs,
+            visibleGraphicalSurfaceCount: visibleGraphicalSurfaceIDs.count
+        )
     }
 
     func exportActiveEQProfile(to url: URL) throws {
@@ -1257,6 +1351,16 @@ final class EqualizerModel: ObservableObject {
     }
 
     func refreshAudioSources() {
+        let coreAudioProcesses = coreAudioProcessInfos()
+        let coreAudioProcessesByBundleID = Dictionary(grouping: coreAudioProcesses.compactMap { process -> (String, CoreAudioProcessInfo)? in
+            guard let bundleIdentifier = process.bundleIdentifier,
+                  bundleIdentifier != Bundle.main.bundleIdentifier else {
+                return nil
+            }
+            return (bundleIdentifier, process)
+        }) { $0.0 }
+            .mapValues { pairs in pairs.map(\.1) }
+
         let runningApplications = NSWorkspace.shared.runningApplications
             .filter { application in
                 application.activationPolicy == .regular &&
@@ -1265,7 +1369,7 @@ final class EqualizerModel: ObservableObject {
             }
             .compactMap { application -> AudioSourceItem? in
                 guard let bundleIdentifier = application.bundleIdentifier else { return nil }
-                return AudioSourceItem(
+                let source = AudioSourceItem(
                     id: bundleIdentifier,
                     title: application.localizedName ?? bundleIdentifier,
                     bundleIdentifier: bundleIdentifier,
@@ -1274,19 +1378,21 @@ final class EqualizerModel: ObservableObject {
                     systemImage: sourceSystemImage(for: bundleIdentifier),
                     isRunning: true
                 )
+                return enrichedAudioSource(source, coreAudioProcessesByBundleID: coreAudioProcessesByBundleID)
             }
 
         var merged: [String: AudioSourceItem] = [:]
         merged[AudioSourceItem.systemMix.id] = AudioSourceItem.systemMix
 
         for source in AudioSourceItem.commonSources {
-            merged[source.id] = source
+            merged[source.id] = enrichedAudioSource(source, coreAudioProcessesByBundleID: coreAudioProcessesByBundleID)
         }
 
         for runningSource in runningApplications {
             if var existing = merged[runningSource.id] {
                 existing.isRunning = true
                 existing.processIdentifier = runningSource.processIdentifier
+                existing.processObjectIDs = runningSource.processObjectIDs
                 merged[runningSource.id] = existing
             } else {
                 merged[runningSource.id] = runningSource
@@ -1300,8 +1406,155 @@ final class EqualizerModel: ObservableObject {
 
         let nextSources = stableSources + runningOnlySources
         guard availableAudioSources != nextSources else { return }
+        let wasRunning = audioEngineRunState == .running
+        let previousCaptureSignature = wasRunning ? sourceCaptureIdentitySignature(for: audioEngineConfiguration) : ""
         availableAudioSources = nextSources
         syncRoutingSourceNodes()
+        if wasRunning {
+            let nextCaptureSignature = sourceCaptureIdentitySignature(for: audioEngineConfiguration)
+            guard previousCaptureSignature != nextCaptureSignature else {
+                updateAudioEngineRendering(scheduleSave: false)
+                return
+            }
+            lastAutoStartFailureSignature = nil
+            restartAudioEngineIfNeeded()
+        } else {
+            lastAutoStartFailureSignature = nil
+            scheduleAutoStartIfNeeded()
+        }
+    }
+
+    private struct CoreAudioProcessInfo {
+        let objectID: AudioObjectID
+        let processID: pid_t?
+        let bundleIdentifier: String?
+        let isRunningOutput: Bool
+    }
+
+    private func enrichedAudioSource(
+        _ source: AudioSourceItem,
+        coreAudioProcessesByBundleID: [String: [CoreAudioProcessInfo]]
+    ) -> AudioSourceItem {
+        guard !source.tapBundleIdentifiers.isEmpty else {
+            return source
+        }
+
+        let matchingProcesses = source.tapBundleIdentifiers.flatMap { bundleIdentifier in
+            coreAudioProcessesByBundleID[bundleIdentifier] ?? []
+        }
+        guard !matchingProcesses.isEmpty else {
+            return source
+        }
+
+        var enriched = source
+        enriched.processObjectIDs = Array(Set(matchingProcesses.map(\.objectID))).sorted()
+        if enriched.processIdentifier == nil {
+            enriched.processIdentifier = matchingProcesses.compactMap(\.processID).first
+        }
+        if matchingProcesses.contains(where: \.isRunningOutput) {
+            enriched.isRunning = true
+        }
+        return enriched
+    }
+
+    private func coreAudioProcessInfos() -> [CoreAudioProcessInfo] {
+        let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(systemObjectID, &address, 0, nil, &dataSize) == noErr else {
+            return []
+        }
+
+        let processCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard processCount > 0 else {
+            return []
+        }
+
+        var processObjectIDs = [AudioObjectID](repeating: 0, count: processCount)
+        let status = processObjectIDs.withUnsafeMutableBufferPointer { pointer in
+            AudioObjectGetPropertyData(systemObjectID, &address, 0, nil, &dataSize, pointer.baseAddress!)
+        }
+        guard status == noErr else {
+            return []
+        }
+
+        return processObjectIDs.compactMap { objectID in
+            guard objectID != kAudioObjectUnknown else { return nil }
+            return CoreAudioProcessInfo(
+                objectID: objectID,
+                processID: coreAudioProcessID(for: objectID),
+                bundleIdentifier: coreAudioProcessBundleID(for: objectID),
+                isRunningOutput: coreAudioProcessIsRunningOutput(objectID)
+            )
+        }
+    }
+
+    private func coreAudioProcessID(for objectID: AudioObjectID) -> pid_t? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(objectID, &address) else {
+            return nil
+        }
+
+        var processID = pid_t(0)
+        var dataSize = UInt32(MemoryLayout<pid_t>.size)
+        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, &processID)
+        return status == noErr && processID > 0 ? processID : nil
+    }
+
+    private func coreAudioProcessBundleID(for objectID: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyBundleID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(objectID, &address) else {
+            return nil
+        }
+
+        var bundleID: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = withUnsafeMutablePointer(to: &bundleID) { pointer in
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, pointer)
+        }
+        guard status == noErr, let bundleID else {
+            return nil
+        }
+        return bundleID.takeRetainedValue() as String
+    }
+
+    private func coreAudioProcessIsRunningOutput(_ objectID: AudioObjectID) -> Bool {
+        if let outputRunning = coreAudioProcessBooleanProperty(kAudioProcessPropertyIsRunningOutput, for: objectID) {
+            return outputRunning
+        }
+        return coreAudioProcessBooleanProperty(kAudioProcessPropertyIsRunning, for: objectID) ?? false
+    }
+
+    private func coreAudioProcessBooleanProperty(
+        _ selector: AudioObjectPropertySelector,
+        for objectID: AudioObjectID
+    ) -> Bool? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(objectID, &address) else {
+            return nil
+        }
+
+        var value = UInt32(0)
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &dataSize, &value)
+        return status == noErr ? value != 0 : nil
     }
 
     func refreshAudioDevices(enforceLock: Bool = true) {
@@ -1323,34 +1576,53 @@ final class EqualizerModel: ObservableObject {
 
         syncRoutingOutputNodes()
         updatePureQVolumeBridge()
+        let virtualFormatChanged = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
+        let shouldHoldVirtualDefault = shouldHoldPureQVirtualOutputAsDefault
+        let correctedVirtualDefault = shouldHoldVirtualDefault &&
+            requestPureQVirtualOutputAsDefaultIfNeeded(refreshAfterChange: false)
 
         if wasRunning {
             let configuration = audioEngineConfiguration
             let resolvedOutputCount = resolvedOutputDeviceIDs(for: configuration).count
             if resolvedOutputCount != configuration.renderTargets.count {
                 stopAudioEngine(manual: false)
-                scheduleAutoStartIfNeeded()
+                if !isHandlingAudioFormatTransition {
+                    scheduleAutoStartIfNeeded()
+                }
                 return
             }
 
-            if devicesChanged ||
-                outputDefaultChanged ||
-                systemOutputDefaultChanged ||
+            if virtualFormatChanged ||
+                devicesChanged ||
+                ((outputDefaultChanged || systemOutputDefaultChanged) && !correctedVirtualDefault) ||
                 previousTakeoverActive != audioEngineTakeoverActive {
                 lastAutoStartFailureSignature = nil
-                restartAudioEngineIfNeeded()
+                if !isHandlingAudioFormatTransition {
+                    restartAudioEngineIfNeeded()
+                }
                 return
             }
 
             updateAudioEngineRendering(scheduleSave: false)
+        } else if shouldHoldVirtualDefault {
+            if devicesChanged || outputDefaultChanged || systemOutputDefaultChanged {
+                lastAutoStartFailureSignature = nil
+            }
+            if !isHandlingAudioFormatTransition {
+                scheduleAutoStartIfNeeded()
+            }
         } else if previousTakeoverActive != audioEngineTakeoverActive {
             lastAutoStartFailureSignature = nil
-            restartAudioEngineIfNeeded()
+            if !isHandlingAudioFormatTransition {
+                restartAudioEngineIfNeeded()
+            }
         } else {
             if devicesChanged || outputDefaultChanged || systemOutputDefaultChanged {
                 lastAutoStartFailureSignature = nil
             }
-            scheduleAutoStartIfNeeded()
+            if !isHandlingAudioFormatTransition {
+                scheduleAutoStartIfNeeded()
+            }
         }
     }
 
@@ -1406,6 +1678,9 @@ final class EqualizerModel: ObservableObject {
 
         driverInstallInProgress = true
         driverInstallMessage = audioEngineStatus.driverInstalled ? "Repairing PureQ audio driver..." : "Installing PureQ audio driver..."
+        driverPostInstallRefreshWorkItem?.cancel()
+        driverPostInstallRefreshWorkItem = nil
+        driverPostInstallRefreshGeneration += 1
         let sourcePath = driverURL.path
         let shouldResumeEngine = audioEngineRunState == .running
         if shouldResumeEngine {
@@ -1426,6 +1701,9 @@ final class EqualizerModel: ObservableObject {
         guard !driverInstallInProgress else { return }
         driverInstallInProgress = true
         driverInstallMessage = "Removing PureQ audio driver..."
+        driverPostInstallRefreshWorkItem?.cancel()
+        driverPostInstallRefreshWorkItem = nil
+        driverPostInstallRefreshGeneration += 1
         let shouldResumeEngine = audioEngineRunState == .running
         if shouldResumeEngine {
             stopAudioEngine(manual: false)
@@ -1463,6 +1741,10 @@ final class EqualizerModel: ObservableObject {
         var didStartRendering = false
         let outputDeviceIDs = resolvedOutputDeviceIDs(for: configuration)
         do {
+            _ = synchronizeVirtualCaptureFormatIfNeeded(for: configuration)
+            if let virtualFormatMismatch = pureQVirtualOutputFormatMismatchDescription(for: configuration) {
+                throw AudioEngineStartError.virtualOutputFormatMismatch(virtualFormatMismatch)
+            }
             if virtualCapture != nil && !shouldDeferVirtualSwitch {
                 switchedDefaultToVirtual = try ensureSystemDefaultForVirtualCapture()
             }
@@ -1477,6 +1759,8 @@ final class EqualizerModel: ObservableObject {
             }
             normalizeRoutedHardwareOutputVolumes(for: configuration)
             lastAutoStartFailureSignature = nil
+            audioEngineCapturedSourceNodeIDs = capturedSourceNodeIDs(in: configuration)
+            resetOutputClippingTelemetry()
             setAudioEngineRunState(audioEngine.runState)
             lastRenderWatchdogSample = nil
             refreshAudioEngineTelemetry()
@@ -1504,11 +1788,13 @@ final class EqualizerModel: ObservableObject {
             autoStartWorkItem = nil
         }
         audioEngine.stopRendering()
+        audioEngineCapturedSourceNodeIDs.removeAll()
         restoreNormalizedHardwareOutputVolumes()
         setAudioEngineRunState(audioEngine.runState)
         lastRenderWatchdogSample = nil
         stopEngineTelemetryPolling()
         refreshAudioEngineTelemetry()
+        resetOutputClippingTelemetry()
         if manual {
             restoreSystemDefaultAfterVirtualCapture()
         }
@@ -1539,13 +1825,8 @@ final class EqualizerModel: ObservableObject {
         driverInstallInProgress = false
         switch result {
         case .success:
-            driverInstallMessage = "PureQ audio driver installed. CoreAudio was restarted."
-            refreshAudioDevices(enforceLock: false)
-            if shouldResumeEngine {
-                startAudioEngine(manual: false)
-            } else {
-                scheduleAutoStartIfNeeded()
-            }
+            driverInstallMessage = "PureQ audio driver installed. Waiting for CoreAudio to reload it..."
+            scheduleDriverPostInstallRefresh(shouldResumeEngine: shouldResumeEngine)
         case .failure(let error):
             driverInstallMessage = "Driver install failed: \(error.localizedDescription)"
             refreshAudioDevices(enforceLock: false)
@@ -1567,27 +1848,109 @@ final class EqualizerModel: ObservableObject {
         }
     }
 
+    private func scheduleDriverPostInstallRefresh(shouldResumeEngine: Bool) {
+        driverPostInstallRefreshGeneration += 1
+        scheduleDriverPostInstallRefreshAttempt(
+            shouldResumeEngine: shouldResumeEngine,
+            remainingAttempts: 8,
+            generation: driverPostInstallRefreshGeneration,
+            delay: 1.0
+        )
+    }
+
+    private func scheduleDriverPostInstallRefreshAttempt(
+        shouldResumeEngine: Bool,
+        remainingAttempts: Int,
+        generation: Int,
+        delay: TimeInterval
+    ) {
+        driverPostInstallRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            DispatchQueue.global(qos: .utility).async {
+                let service = AudioOutputService()
+                _ = service.setPureQVirtualOutputHidden(false)
+                let snapshot = service.snapshot()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          generation == self.driverPostInstallRefreshGeneration,
+                          !self.didPrepareForApplicationExit else {
+                        return
+                    }
+
+                    self.outputDevices = snapshot.devices
+                    self.defaultOutputUID = snapshot.defaultOutputUID
+                    self.defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+                    self.syncRoutingOutputNodes()
+                    self.updatePureQVolumeBridge()
+                    let virtualFormatChanged = self.synchronizeVirtualCaptureFormatIfNeeded(for: self.audioEngineConfiguration)
+
+                    let virtualOutputLoaded = snapshot.devices.contains(where: \.isPureQVirtualOutput)
+                    if virtualOutputLoaded {
+                        self.driverInstallMessage = virtualFormatChanged
+                            ? "PureQ audio driver installed. PureQ Virtual Output is loaded and format-synced."
+                            : "PureQ audio driver installed. PureQ Virtual Output is loaded."
+                        if shouldResumeEngine {
+                            self.startAudioEngine(manual: false)
+                        } else {
+                            self.scheduleAutoStartIfNeeded()
+                        }
+                    } else if remainingAttempts > 0 {
+                        self.driverInstallMessage = "PureQ audio driver installed. Waiting for PureQ Virtual Output to appear..."
+                        self.scheduleDriverPostInstallRefreshAttempt(
+                            shouldResumeEngine: shouldResumeEngine,
+                            remainingAttempts: remainingAttempts - 1,
+                            generation: generation,
+                            delay: min(delay + 0.75, 3.0)
+                        )
+                    } else {
+                        self.driverInstallMessage = "PureQ audio driver installed, but CoreAudio has not exposed PureQ Virtual Output yet. Try Refresh if it does not appear."
+                        self.scheduleAutoStartIfNeeded()
+                    }
+                }
+            }
+        }
+        driverPostInstallRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     nonisolated private static func driverInstallCommand(sourcePath: String) -> String {
         let source = shellQuoted(sourcePath)
-        let destination = shellQuoted("/Library/Audio/Plug-Ins/HAL/PureQ.driver")
-        let destinationDirectory = shellQuoted("/Library/Audio/Plug-Ins/HAL")
-        return [
-            "/bin/mkdir -p \(destinationDirectory)",
-            "/bin/rm -rf \(destination)",
-            "/usr/bin/ditto --norsrc --noextattr \(source) \(destination)",
-            "/usr/sbin/chown -R root:wheel \(destination)",
-            "/bin/chmod -R go-w \(destination)",
-            "(/usr/bin/xattr -cr \(destination) >/dev/null 2>&1 || true)",
+        let script = [
+            "set -eu",
+            "src=\(source)",
+            "dest='/Library/Audio/Plug-Ins/HAL/PureQ.driver'",
+            "hal_dir='/Library/Audio/Plug-Ins/HAL'",
+            "support='/Library/Application Support/PureQ'",
+            "stage=\"$hal_dir/.PureQ.driver.install.$$\"",
+            "backup=\"$support/Backups/PureQ.driver.$(/bin/date +%Y%m%d%H%M%S)\"",
+            "case \"$src\" in */PureQ.driver) ;; *) echo 'Refusing unexpected PureQ driver source.' >&2; exit 64;; esac",
+            "case \"$dest\" in /Library/Audio/Plug-Ins/HAL/PureQ.driver) ;; *) echo 'Refusing unexpected PureQ driver destination.' >&2; exit 64;; esac",
+            "test -d \"$src\" || { echo 'Bundled PureQ.driver is missing.' >&2; exit 66; }",
+            "cleanup(){ exit_status=$?; /bin/rm -rf \"$stage\"; if [ \"$exit_status\" -ne 0 ] && [ ! -d \"$dest\" ] && [ -d \"$backup\" ]; then /bin/mv \"$backup\" \"$dest\"; fi; exit \"$exit_status\"; }",
+            "trap cleanup EXIT INT TERM",
+            "/bin/mkdir -p \"$hal_dir\" \"$support/Backups\"",
+            "/bin/rm -rf \"$stage\"",
+            "/usr/bin/env COPYFILE_DISABLE=1 /usr/bin/ditto --norsrc --noextattr \"$src\" \"$stage\"",
+            "/usr/sbin/chown -R root:wheel \"$stage\"",
+            "/bin/chmod -R go-w \"$stage\"",
+            "(/usr/bin/xattr -cr \"$stage\" >/dev/null 2>&1 || true)",
+            "if [ -e \"$dest\" ]; then /bin/mv \"$dest\" \"$backup\"; fi",
+            "/bin/mv \"$stage\" \"$dest\"",
+            "trap - EXIT INT TERM",
             "(/usr/bin/killall coreaudiod >/dev/null 2>&1 || true)"
         ].joined(separator: " && ")
+        return "/bin/zsh -c \(shellQuoted(script))"
     }
 
     nonisolated private static func driverUninstallCommand() -> String {
-        let destination = shellQuoted("/Library/Audio/Plug-Ins/HAL/PureQ.driver")
-        return [
-            "/bin/rm -rf \(destination)",
+        let script = [
+            "set -eu",
+            "dest='/Library/Audio/Plug-Ins/HAL/PureQ.driver'",
+            "case \"$dest\" in /Library/Audio/Plug-Ins/HAL/PureQ.driver) ;; *) echo 'Refusing unexpected PureQ driver destination.' >&2; exit 64;; esac",
+            "if [ -e \"$dest\" ]; then /bin/rm -rf \"$dest\"; fi",
             "(/usr/bin/killall coreaudiod >/dev/null 2>&1 || true)"
         ].joined(separator: " && ")
+        return "/bin/zsh -c \(shellQuoted(script))"
     }
 
     nonisolated private static func runPrivilegedShellCommand(_ command: String) throws {
@@ -1631,12 +1994,64 @@ final class EqualizerModel: ObservableObject {
     }
 
     private func restartAudioEngineIfNeeded() {
+        _ = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
         guard audioEngineRunState == .running else {
             scheduleAutoStartIfNeeded()
             return
         }
         stopAudioEngine(manual: false)
         startAudioEngine(manual: false)
+    }
+
+    private func applySourceRouteChange(previousConfiguration: AudioEngineConfiguration) {
+        let nextConfiguration = audioEngineConfiguration
+        guard canApplySourceRouteChangeLive(
+            previousConfiguration: previousConfiguration,
+            nextConfiguration: nextConfiguration
+        ) else {
+            restartAudioEngineIfNeeded()
+            return
+        }
+
+        updateAudioEngineRendering(scheduleSave: false)
+    }
+
+    private func canApplySourceRouteChangeLive(
+        previousConfiguration: AudioEngineConfiguration,
+        nextConfiguration: AudioEngineConfiguration
+    ) -> Bool {
+        guard audioEngineRunState == .running,
+              !audioEngineCapturedSourceNodeIDs.isEmpty else {
+            return false
+        }
+
+        let nextCapturedSourceNodeIDs = capturedSourceNodeIDs(in: nextConfiguration)
+        if nextCapturedSourceNodeIDs == audioEngineCapturedSourceNodeIDs {
+            return true
+        }
+
+        return audioEngineCapturedSourceNodeIDs.count == 1 &&
+            nextCapturedSourceNodeIDs.isSubset(of: audioEngineCapturedSourceNodeIDs) &&
+            capturedSourceNodeIDs(in: previousConfiguration) == audioEngineCapturedSourceNodeIDs
+    }
+
+    private func capturedSourceNodeIDs(in configuration: AudioEngineConfiguration) -> Set<RoutingNode.ID> {
+        Set(configuration.sourceRoutes.filter(\.reachesOutput).map(\.sourceNodeID))
+    }
+
+    private func sourceCaptureIdentitySignature(for configuration: AudioEngineConfiguration) -> String {
+        configuration.sourceRoutes
+            .filter(\.reachesOutput)
+            .map { route in
+                [
+                    route.sourceNodeID.uuidString,
+                    route.sourceID,
+                    route.processIdentifier.map(String.init) ?? "no-pid",
+                    route.processObjectIDs.map(String.init).joined(separator: ",")
+                ].joined(separator: ":")
+            }
+            .sorted()
+            .joined(separator: "|")
     }
 
     private func scheduleAutoStartIfNeeded() {
@@ -1708,6 +2123,18 @@ final class EqualizerModel: ObservableObject {
             }
             .sorted()
             .joined(separator: "|")
+        let sourceCaptureSignature = configuration.sourceRoutes
+            .map { route in
+                [
+                    route.sourceNodeID.uuidString,
+                    route.sourceID,
+                    route.processIdentifier.map(String.init) ?? "no-pid",
+                    route.processObjectIDs.map(String.init).joined(separator: ","),
+                    "\(route.reachesOutput)"
+                ].joined(separator: ":")
+            }
+            .sorted()
+            .joined(separator: "|")
         return [
             configuration.outputUID ?? "no-output",
             configuration.virtualCaptureUID ?? "no-capture",
@@ -1717,6 +2144,7 @@ final class EqualizerModel: ObservableObject {
             "\(configuration.mutesOriginalAudio)",
             "\(powerEnabled)",
             renderTargetSignature,
+            sourceCaptureSignature,
             nodeSignature,
             connectionSignature
         ].joined(separator: "#")
@@ -2269,11 +2697,12 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        let previousConfiguration = audioEngineConfiguration
         rememberUndo(.routing)
         routingNodes[index].sourceMutedValue.toggle()
         syncRoutingOutputNodes()
         schedulePersistedStateSave()
-        restartAudioEngineIfNeeded()
+        applySourceRouteChange(previousConfiguration: previousConfiguration)
     }
 
     func toggleRoutingSourceSolo(id: RoutingNode.ID) {
@@ -2282,11 +2711,12 @@ final class EqualizerModel: ObservableObject {
             return
         }
 
+        let previousConfiguration = audioEngineConfiguration
         rememberUndo(.routing)
         routingNodes[index].sourceSoloedValue.toggle()
         syncRoutingOutputNodes()
         schedulePersistedStateSave()
-        restartAudioEngineIfNeeded()
+        applySourceRouteChange(previousConfiguration: previousConfiguration)
     }
 
     func setRoutingNodeOutput(id: RoutingNode.ID, uid: String?) {
@@ -2333,19 +2763,33 @@ final class EqualizerModel: ObservableObject {
     }
 
     private func startCoreAudioDeviceObserver() {
-        audioService.observeDeviceChanges { [weak self] in
+        audioService.observeDeviceChanges { [weak self] reason in
             DispatchQueue.main.async { [weak self] in
-                self?.scheduleAudioTopologyRefresh(retryCount: 3)
+                switch reason {
+                case .deviceFormat:
+                    self?.scheduleAudioFormatTransitionRefresh(retryCount: 3)
+                case .topology, .defaultOutput:
+                    self?.scheduleAudioTopologyRefresh(retryCount: 3)
+                }
             }
         }
     }
 
-    private func scheduleAudioTopologyRefresh(after delay: TimeInterval = 0.25, retryCount: Int = 0) {
+    private func scheduleAudioTopologyRefresh(
+        after delay: TimeInterval = 0.25,
+        retryCount: Int = 0,
+        restartRunningEngine: Bool = false
+    ) {
         audioDeviceRefreshWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             refreshAudioSources()
             refreshAudioDevices(enforceLock: false)
+            if restartRunningEngine, audioEngineRunState == .running {
+                lastAutoStartFailureSignature = nil
+                restartAudioEngineIfNeeded()
+                return
+            }
             if audioEngineRunState != .running && canStartAudioEngine {
                 lastAutoStartFailureSignature = nil
                 scheduleAutoStartIfNeeded()
@@ -2354,10 +2798,84 @@ final class EqualizerModel: ObservableObject {
                autoStartEngineEnabled,
                !manualStopSuppressesAutoStart,
                audioEngineRunState != .running {
-                scheduleAudioTopologyRefresh(after: 1.0, retryCount: retryCount - 1)
+                scheduleAudioTopologyRefresh(
+                    after: 1.0,
+                    retryCount: retryCount - 1,
+                    restartRunningEngine: restartRunningEngine
+                )
             }
         }
         audioDeviceRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func scheduleAudioFormatTransitionRefresh(
+        after delay: TimeInterval = 0.55,
+        retryCount: Int = 0
+    ) {
+        audioDeviceRefreshWorkItem?.cancel()
+        audioDeviceRefreshWorkItem = nil
+        audioFormatTransitionWorkItem?.cancel()
+        audioFormatTransitionGeneration += 1
+        let generation = audioFormatTransitionGeneration
+        let shouldResumeEngine = audioEngineRunState == .running ||
+            audioFormatTransitionShouldResumeEngine ||
+            (autoStartEngineEnabled && !manualStopSuppressesAutoStart && canStartAudioEngine)
+
+        if audioEngineRunState == .running {
+            audioFormatTransitionShouldResumeEngine = true
+            lastAutoStartFailureSignature = nil
+            isHandlingAudioFormatTransition = true
+            stopAudioEngine(manual: false)
+            isHandlingAudioFormatTransition = false
+        } else if shouldResumeEngine {
+            audioFormatTransitionShouldResumeEngine = true
+            lastAutoStartFailureSignature = nil
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.audioFormatTransitionGeneration else { return }
+            self.isHandlingAudioFormatTransition = true
+            self.refreshAudioSources()
+            self.refreshAudioDevices(enforceLock: false)
+            self.isHandlingAudioFormatTransition = false
+
+            let shouldRestart = self.audioFormatTransitionShouldResumeEngine || shouldResumeEngine
+            self.audioFormatTransitionShouldResumeEngine = false
+            if shouldRestart, self.canStartAudioEngine {
+                self.lastAutoStartFailureSignature = nil
+                self.startAudioEngine(manual: false)
+                return
+            }
+
+            if retryCount > 0,
+               shouldRestart,
+               self.autoStartEngineEnabled,
+               !self.manualStopSuppressesAutoStart {
+                self.scheduleAudioFormatTransitionRefresh(after: 0.85, retryCount: retryCount - 1)
+            } else if self.autoStartEngineEnabled,
+                      !self.manualStopSuppressesAutoStart,
+                      !self.isHandlingAudioFormatTransition {
+                self.scheduleAutoStartIfNeeded()
+            }
+        }
+        audioFormatTransitionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func scheduleVirtualCaptureFormatVerification(after delay: TimeInterval = 0.35) {
+        guard !didPrepareForApplicationExit else { return }
+        virtualCaptureFormatVerificationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.didPrepareForApplicationExit,
+                  !self.isHandlingAudioFormatTransition else {
+                return
+            }
+            self.virtualCaptureFormatVerificationWorkItem = nil
+            self.refreshAudioDevices(enforceLock: false)
+        }
+        virtualCaptureFormatVerificationWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
@@ -2406,6 +2924,7 @@ final class EqualizerModel: ObservableObject {
     private func refreshAudioEngineTelemetry() {
         let snapshot = audioEngine.telemetry
         audioEngineTelemetry = snapshot
+        updateOutputClippingStatus(from: snapshot)
         monitorAudioEngineRenderProgress(snapshot)
         if abs(audioEngineSampleRate - snapshot.sampleRate) > 0.5 {
             audioEngineSampleRate = snapshot.sampleRate
@@ -2419,6 +2938,62 @@ final class EqualizerModel: ObservableObject {
             smoothMeters: true,
             forceVisualRefresh: highFrameRateUIEnabled
         )
+    }
+
+    private func updateOutputClippingStatus(from snapshot: AudioEngineTelemetry) {
+        guard audioEngineRunState == .running else {
+            resetOutputClippingTelemetry()
+            return
+        }
+
+        let now = Date()
+        let recentSamples: UInt64
+        if snapshot.clippedSampleCount >= lastTelemetryClippedSampleCount {
+            recentSamples = snapshot.clippedSampleCount - lastTelemetryClippedSampleCount
+        } else {
+            recentSamples = snapshot.clippedSampleCount
+        }
+
+        if recentSamples > 0 || snapshot.clippedCallbackCount > lastTelemetryClipEventCount {
+            outputClipHoldUntil = now.addingTimeInterval(2.0)
+        }
+
+        let peakDecibels = quantizedPeakDecibels(snapshot.outputPeakDecibels)
+        let nextStatus = OutputClippingStatus(
+            peakDecibels: peakDecibels,
+            totalClippedSamples: snapshot.clippedSampleCount,
+            totalClipEvents: snapshot.clippedCallbackCount,
+            recentClippedSamples: recentSamples,
+            isClipHeld: outputClipHoldUntil > now
+        )
+        let currentStatus = outputClippingStatus
+        let publishTime = Date.timeIntervalSinceReferenceDate
+        let shouldPublish = nextStatus.risk != currentStatus.risk ||
+            nextStatus.recentClippedSamples > 0 ||
+            nextStatus.totalClipEvents != currentStatus.totalClipEvents ||
+            publishTime - lastOutputClippingStatusPublishTime >= 0.18
+        if nextStatus != currentStatus, shouldPublish {
+            outputClippingStatus = nextStatus
+            lastOutputClippingStatusPublishTime = publishTime
+        }
+
+        lastTelemetryClippedSampleCount = snapshot.clippedSampleCount
+        lastTelemetryClipEventCount = snapshot.clippedCallbackCount
+    }
+
+    private func resetOutputClippingTelemetry() {
+        lastTelemetryClippedSampleCount = 0
+        lastTelemetryClipEventCount = 0
+        outputClipHoldUntil = .distantPast
+        lastOutputClippingStatusPublishTime = 0
+        if outputClippingStatus != .empty {
+            outputClippingStatus = .empty
+        }
+    }
+
+    private func quantizedPeakDecibels(_ value: Double) -> Double {
+        guard value.isFinite else { return 18.1 }
+        return ((value.clamped(to: -120...18.1) * 10).rounded() / 10)
     }
 
     private func monitorAudioEngineRenderProgress(_ snapshot: AudioEngineTelemetry) {
@@ -2474,7 +3049,7 @@ final class EqualizerModel: ObservableObject {
     }
 
     private var visualAnalyzerFrameRate: Double {
-        highFrameRateUIEnabled ? 60.0 : 30.0
+        highFrameRateUIEnabled ? 60.0 : 15.0
     }
 
     @discardableResult
@@ -2482,22 +3057,25 @@ final class EqualizerModel: ObservableObject {
         guard let virtualOutput = pureQVirtualOutputDevice else {
             return false
         }
-        let needsSwitch = outputDefaultsNeedChanging(to: virtualOutput.uid)
-        let changed = switchSystemDefaultToVirtualOutputForEngine()
-        if needsSwitch && !changed && outputDefaultsNeedChanging(to: virtualOutput.uid) {
-            throw AudioEngineStartError.virtualOutputSwitchFailed(virtualOutput.name)
+        guard outputDefaultsNeedChanging(to: virtualOutput.uid) else {
+            return false
         }
-        return changed
+        requestPureQVirtualOutputAsDefaultIfNeeded()
+        throw AudioEngineStartError.virtualOutputSwitchPending(virtualOutput.name)
     }
 
     @discardableResult
-    private func switchSystemDefaultToVirtualOutputForEngine() -> Bool {
+    private func requestPureQVirtualOutputAsDefaultIfNeeded(refreshAfterChange: Bool = true) -> Bool {
+        revealPureQVirtualOutputIfAvailable()
+
         guard let virtualOutput = pureQVirtualOutputDevice else {
             return false
         }
 
+        _ = synchronizeVirtualCaptureFormatIfNeeded(for: audioEngineConfiguration)
+
         guard outputDefaultsNeedChanging(to: virtualOutput.uid) else {
-            return false
+            return true
         }
 
         if preVirtualDefaultOutputUID == nil {
@@ -2507,11 +3085,361 @@ final class EqualizerModel: ObservableObject {
             preVirtualDefaultOutputUID = currentDefault
         }
 
-        let changed = audioService.setDefaultOutput(uid: virtualOutput.uid)
-        if changed {
-            refreshAudioDevices(enforceLock: false)
+        requestDefaultOutputSwitch(to: virtualOutput.uid, refreshAfterChange: refreshAfterChange)
+        return true
+    }
+
+    private func requestDefaultOutputSwitch(to uid: String, refreshAfterChange: Bool) {
+        if defaultOutputSwitchInFlight {
+            pendingDefaultOutputSwitchUID = uid
+            pendingDefaultOutputSwitchRefreshAfterChange = pendingDefaultOutputSwitchRefreshAfterChange || refreshAfterChange
+            return
         }
-        return changed
+
+        defaultOutputSwitchInFlight = true
+        let service = audioService
+        defaultOutputSwitchQueue.async { [uid, refreshAfterChange, service] in
+            let changed = service.setDefaultOutput(uid: uid)
+            let snapshot = service.snapshot()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.finishDefaultOutputSwitch(
+                    requestedUID: uid,
+                    changed: changed,
+                    snapshot: snapshot,
+                    refreshAfterChange: refreshAfterChange
+                )
+            }
+        }
+    }
+
+    private func finishDefaultOutputSwitch(
+        requestedUID: String,
+        changed: Bool,
+        snapshot: AudioOutputSnapshot,
+        refreshAfterChange: Bool
+    ) {
+        defaultOutputSwitchInFlight = false
+
+        if changed {
+            if refreshAfterChange {
+                refreshAudioDevices(enforceLock: false)
+            } else {
+                outputDevices = snapshot.devices
+                defaultOutputUID = snapshot.defaultOutputUID
+                defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+                syncRoutingOutputNodes()
+                updatePureQVolumeBridge()
+            }
+            if audioEngineRunState != .running {
+                lastAutoStartFailureSignature = nil
+                scheduleAutoStartIfNeeded()
+            }
+        } else if snapshot.defaultOutputUID != defaultOutputUID ||
+                    snapshot.defaultSystemOutputUID != defaultSystemOutputUID ||
+                    snapshot.devices != outputDevices {
+            outputDevices = snapshot.devices
+            defaultOutputUID = snapshot.defaultOutputUID
+            defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+            syncRoutingOutputNodes()
+            updatePureQVolumeBridge()
+        }
+
+        guard let pendingUID = pendingDefaultOutputSwitchUID else {
+            pendingDefaultOutputSwitchRefreshAfterChange = false
+            return
+        }
+        let pendingRefresh = pendingDefaultOutputSwitchRefreshAfterChange
+        pendingDefaultOutputSwitchUID = nil
+        pendingDefaultOutputSwitchRefreshAfterChange = false
+        guard pendingUID != requestedUID || outputDefaultsNeedChanging(to: pendingUID) else {
+            return
+        }
+        requestDefaultOutputSwitch(to: pendingUID, refreshAfterChange: pendingRefresh)
+    }
+
+    private var shouldHoldPureQVirtualOutputAsDefault: Bool {
+        powerEnabled && pureQVirtualOutputDevice != nil
+    }
+
+    @discardableResult
+    private func synchronizeVirtualCaptureFormatIfNeeded(for configuration: AudioEngineConfiguration) -> Bool {
+        guard let virtualOutput = pureQVirtualOutputDevice else {
+            return false
+        }
+
+        let identityChanged = synchronizeVirtualCaptureIdentity(virtualOutput, for: configuration)
+        let rateChanged = synchronizeVirtualCaptureSampleRate(virtualOutput, for: configuration)
+        let bufferChanged = synchronizeAudioBufferFrameSizes(for: configuration, virtualCapture: virtualOutput)
+        return identityChanged || rateChanged || bufferChanged
+    }
+
+    @discardableResult
+    private func synchronizeVirtualCaptureIdentity(
+        _ virtualOutput: AudioOutputDevice,
+        for configuration: AudioEngineConfiguration
+    ) -> Bool {
+        let targetName = preferredVirtualCaptureHardwareOutput(for: configuration)
+            .map { "\($0.name) (PureQ)" } ??
+            "PureQ Virtual Output"
+        let currentName = audioService.deviceName(uid: virtualOutput.uid, includeHidden: true) ??
+            virtualOutput.name
+
+        guard currentName != targetName else {
+            return false
+        }
+
+        guard audioService.setDeviceName(uid: virtualOutput.uid, name: targetName, includeHidden: true) else {
+            return false
+        }
+
+        let snapshot = audioService.snapshot()
+        outputDevices = snapshot.devices
+        defaultOutputUID = snapshot.defaultOutputUID
+        defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+        syncRoutingOutputNodes()
+        updatePureQVolumeBridge()
+        return true
+    }
+
+    @discardableResult
+    private func synchronizeVirtualCaptureSampleRate(
+        _ virtualOutput: AudioOutputDevice,
+        for configuration: AudioEngineConfiguration
+    ) -> Bool {
+        guard let targetSampleRate = preferredVirtualCaptureSampleRate(for: configuration) else {
+            return false
+        }
+
+        let resolvedSampleRate = targetSampleRate.clamped(to: 8_000...768_000)
+        let nominalSampleRate = audioService.nominalSampleRate(uid: virtualOutput.uid, includeHidden: true) ??
+            virtualOutput.nominalSampleRate ??
+            0
+        let actualSampleRate = audioService.actualSampleRate(uid: virtualOutput.uid, includeHidden: true)
+        let streamSampleRates = audioService.streamSampleRates(uid: virtualOutput.uid, includeHidden: true)
+        let nominalSampleRateNeedsReset = !sampleRatesMatch(nominalSampleRate, resolvedSampleRate)
+        let actualSampleRateNeedsReset = actualSampleRate.map { !sampleRatesMatch($0, resolvedSampleRate) } ?? false
+        let streamSampleRatesNeedReset = streamSampleRates.contains { !sampleRatesMatch($0, resolvedSampleRate) }
+        let actualSampleRateMatches = actualSampleRate.map { sampleRatesMatch($0, resolvedSampleRate) } ?? false
+        guard nominalSampleRateNeedsReset || actualSampleRateNeedsReset || streamSampleRatesNeedReset else {
+            return false
+        }
+
+        if nominalSampleRateNeedsReset,
+           actualSampleRateMatches,
+           !actualSampleRateNeedsReset,
+           !streamSampleRatesNeedReset,
+           let lastAttempt = lastVirtualCaptureNominalSyncAttempt,
+           lastAttempt.uid == virtualOutput.uid,
+           sampleRatesMatch(lastAttempt.sampleRate, resolvedSampleRate),
+           Date().timeIntervalSince(lastAttempt.timestamp) < 4.0 {
+            return false
+        }
+
+        if audioService.setNominalSampleRate(uid: virtualOutput.uid, sampleRate: resolvedSampleRate, includeHidden: true) {
+            lastVirtualCaptureNominalSyncAttempt = (
+                uid: virtualOutput.uid,
+                sampleRate: resolvedSampleRate,
+                timestamp: Date()
+            )
+            scheduleVirtualCaptureFormatVerification(after: (actualSampleRateNeedsReset || streamSampleRatesNeedReset) ? 0.35 : 1.5)
+            return actualSampleRateNeedsReset || actualSampleRate == nil || streamSampleRatesNeedReset
+        }
+        return false
+    }
+
+    private func pureQVirtualOutputFormatMismatchDescription(for configuration: AudioEngineConfiguration? = nil) -> String? {
+        guard let virtualOutput = pureQVirtualOutputDevice else {
+            return nil
+        }
+
+        let nominalSampleRate = audioService.nominalSampleRate(uid: virtualOutput.uid, includeHidden: true) ??
+            virtualOutput.nominalSampleRate
+        let actualSampleRate = audioService.actualSampleRate(uid: virtualOutput.uid, includeHidden: true)
+        let streamSampleRates = audioService.streamSampleRates(uid: virtualOutput.uid, includeHidden: true)
+
+        guard let configuration,
+              let targetSampleRate = preferredVirtualCaptureSampleRate(for: configuration) else {
+            return nil
+        }
+
+        let resolvedSampleRate = targetSampleRate.clamped(to: 8_000...768_000)
+        var mismatches: [String] = []
+        if let nominalSampleRate,
+           !sampleRatesMatch(nominalSampleRate, resolvedSampleRate) {
+            mismatches.append("nominal \(sampleRateDescription(nominalSampleRate))")
+        }
+        if let actualSampleRate {
+            if !sampleRatesMatch(actualSampleRate, resolvedSampleRate) {
+                mismatches.append("actual \(sampleRateDescription(actualSampleRate))")
+            }
+        }
+        let mismatchedStreamRates = streamSampleRates.filter { !sampleRatesMatch($0, resolvedSampleRate) }
+        if !mismatchedStreamRates.isEmpty {
+            mismatches.append("stream \(sampleRateListDescription(mismatchedStreamRates))")
+        }
+
+        if !mismatches.isEmpty {
+            return "PureQ Virtual Output format is not synchronized (\(mismatches.joined(separator: ", "))) while the routed hardware output expects \(sampleRateDescription(resolvedSampleRate)). Repair/restart the driver before audio testing."
+        }
+
+        return nil
+    }
+
+    private func sampleRatesMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        let tolerance = max(5.0, max(abs(lhs), abs(rhs)) * 0.00005)
+        return abs(lhs - rhs) <= tolerance
+    }
+
+    private func sampleRateDescription(_ value: Double) -> String {
+        if value >= 1_000 {
+            let khz = value / 1_000
+            return String(format: "%.3g kHz", khz)
+        }
+        return String(format: "%.1f Hz", value)
+    }
+
+    private func sampleRateListDescription(_ values: [Double]) -> String {
+        let uniqueValues = values.reduce(into: [Double]()) { result, value in
+            guard !result.contains(where: { sampleRatesMatch($0, value) }) else { return }
+            result.append(value)
+        }
+        return uniqueValues.map(sampleRateDescription).joined(separator: ", ")
+    }
+
+    private func preferredVirtualCaptureSampleRate(for configuration: AudioEngineConfiguration) -> Double? {
+        guard let output = preferredVirtualCaptureHardwareOutput(for: configuration) else {
+            return nil
+        }
+        return audioService.actualSampleRate(uid: output.uid) ??
+            output.nominalSampleRate
+    }
+
+    private func preferredHardwareOutputUIDsForVirtualCaptureFallback() -> Set<String> {
+        let hardwareUIDs = Set(hardwareOutputDevices.map(\.uid))
+        let preferredUIDs = [
+            preVirtualDefaultOutputUID,
+            defaultOutputUID,
+            defaultSystemOutputUID,
+            lastAudioRecoveryOutputUID
+        ]
+            .compactMap(\.self)
+            .filter { hardwareUIDs.contains($0) }
+
+        if !preferredUIDs.isEmpty {
+            return Set(preferredUIDs)
+        }
+
+        return Set(hardwareOutputDevices.prefix(1).map(\.uid))
+    }
+
+    private func preferredVirtualCaptureHardwareOutput(for configuration: AudioEngineConfiguration) -> AudioOutputDevice? {
+        let hardwareByUID = Dictionary(uniqueKeysWithValues: hardwareOutputDevices.map { ($0.uid, $0) })
+
+        if let outputUID = configuration.outputUID,
+           let output = hardwareByUID[outputUID] {
+            return output
+        }
+
+        for target in configuration.renderTargets {
+            if let output = hardwareByUID[target.outputUID] {
+                return output
+            }
+        }
+
+        let fallbackUIDs = [
+            preVirtualDefaultOutputUID,
+            defaultOutputUID,
+            defaultSystemOutputUID,
+            lastAudioRecoveryOutputUID
+        ].compactMap(\.self)
+
+        for uid in fallbackUIDs {
+            if let output = hardwareByUID[uid] {
+                return output
+            }
+        }
+
+        return hardwareOutputDevices.first
+    }
+
+    @discardableResult
+    private func synchronizeAudioBufferFrameSizes(
+        for configuration: AudioEngineConfiguration,
+        virtualCapture: AudioOutputDevice?
+    ) -> Bool {
+        let targetUIDs = Set(configuration.renderTargets.map(\.outputUID))
+        var changed = false
+
+        if let virtualCapture {
+            let sampleRate = preferredVirtualCaptureSampleRate(for: configuration) ??
+                virtualCapture.nominalSampleRate ??
+                audioEngineSampleRate
+            changed = setPreferredBufferFrameSize(
+                uid: virtualCapture.uid,
+                sampleRate: sampleRate,
+                includeHidden: true
+            ) || changed
+        }
+
+        for output in hardwareOutputDevices where targetUIDs.contains(output.uid) {
+            let sampleRate = audioService.actualSampleRate(uid: output.uid) ??
+                output.nominalSampleRate ??
+                audioEngineSampleRate
+            changed = setPreferredBufferFrameSize(
+                uid: output.uid,
+                sampleRate: sampleRate,
+                includeHidden: false
+            ) || changed
+        }
+
+        guard changed else { return false }
+        let snapshot = audioService.snapshot()
+        outputDevices = snapshot.devices
+        defaultOutputUID = snapshot.defaultOutputUID
+        defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+        updatePureQVolumeBridge()
+        return true
+    }
+
+    private func setPreferredBufferFrameSize(
+        uid: String,
+        sampleRate: Double,
+        includeHidden: Bool
+    ) -> Bool {
+        let preferredFrames = preferredBufferFrameSize(for: sampleRate)
+        guard audioService.bufferFrameSize(uid: uid, includeHidden: includeHidden) != preferredFrames else {
+            return false
+        }
+        return audioService.setBufferFrameSize(
+            uid: uid,
+            frames: preferredFrames,
+            includeHidden: includeHidden
+        )
+    }
+
+    private func preferredBufferFrameSize(for sampleRate: Double) -> UInt32 {
+        let rate = sampleRate.clamped(to: 44_100...768_000)
+        let targetFrames = Int((rate / 100).rounded(.up))
+        var powerOfTwo = 512
+        while powerOfTwo < targetFrames, powerOfTwo < 4_096 {
+            powerOfTwo <<= 1
+        }
+        return UInt32(powerOfTwo.clamped(to: 512...4_096))
+    }
+
+    private func revealPureQVirtualOutputIfAvailable() {
+        _ = audioService.setPureQVirtualOutputHidden(false)
+        let snapshot = audioService.snapshot()
+        outputDevices = snapshot.devices
+        defaultOutputUID = snapshot.defaultOutputUID
+        defaultSystemOutputUID = snapshot.defaultSystemOutputUID
+        syncRoutingOutputNodes()
+        updatePureQVolumeBridge()
+    }
+
+    private func hidePureQVirtualOutputForApplicationExit() {
+        _ = audioService.setPureQVirtualOutputHidden(true)
     }
 
     private func restoreSystemDefaultAfterVirtualCapture() {
@@ -2528,6 +3456,74 @@ final class EqualizerModel: ObservableObject {
         if audioService.setDefaultOutput(uid: previousUID) {
             refreshAudioDevices(enforceLock: false)
         }
+    }
+
+    private func restorePreferredOutputForApplicationExit(preferredUID: String?) {
+        preVirtualDefaultOutputUID = nil
+
+        let snapshot = audioService.snapshot()
+        let hardwareUIDs = Set(snapshot.devices.filter { !$0.isPureQVirtualOutput }.map(\.uid))
+        guard let preferredUID,
+              hardwareUIDs.contains(preferredUID) else {
+            return
+        }
+
+        if audioService.setDefaultOutput(uid: preferredUID) {
+            let refreshedSnapshot = audioService.snapshot()
+            outputDevices = refreshedSnapshot.devices
+            defaultOutputUID = refreshedSnapshot.defaultOutputUID
+            defaultSystemOutputUID = refreshedSnapshot.defaultSystemOutputUID
+        }
+    }
+
+    private func rememberHardwareDefaultForAudioRecovery(from snapshot: AudioOutputSnapshot) {
+        let hardwareOutputs = snapshot.devices.filter { !$0.isPureQVirtualOutput }
+        let preferredHardwareOutput = snapshot.defaultOutputUID.flatMap { defaultUID in
+            hardwareOutputs.first { $0.uid == defaultUID }
+        } ?? snapshot.defaultSystemOutputUID.flatMap { defaultSystemUID in
+            hardwareOutputs.first { $0.uid == defaultSystemUID }
+        }
+
+        guard let preferredHardwareOutput,
+              preferredHardwareOutput.uid != lastAudioRecoveryOutputUID else {
+            return
+        }
+
+        lastAudioRecoveryOutputUID = preferredHardwareOutput.uid
+        let outputUID = preferredHardwareOutput.uid
+        let outputName = preferredHardwareOutput.name
+        persistenceQueue.async {
+            try? PureQPersistenceStore.writeAudioRecoveryState(
+                lastHardwareOutputUID: outputUID,
+                lastHardwareOutputName: outputName
+            )
+        }
+    }
+
+    private func preferredApplicationExitOutputUID() -> String? {
+        let hardwareUIDs = Set(hardwareOutputDevices.map(\.uid))
+        if let routedOutputUID = audioEngineConfiguration.renderTargets
+            .map(\.outputUID)
+            .first(where: { hardwareUIDs.contains($0) }) {
+            return routedOutputUID
+        }
+
+        if let preVirtualDefaultOutputUID,
+           hardwareUIDs.contains(preVirtualDefaultOutputUID) {
+            return preVirtualDefaultOutputUID
+        }
+
+        if let defaultOutputUID,
+           hardwareUIDs.contains(defaultOutputUID) {
+            return defaultOutputUID
+        }
+
+        if let defaultSystemOutputUID,
+           hardwareUIDs.contains(defaultSystemOutputUID) {
+            return defaultSystemOutputUID
+        }
+
+        return hardwareOutputDevices.first?.uid
     }
 
     private func normalizeRoutedHardwareOutputVolumes(for configuration: AudioEngineConfiguration) {
@@ -2938,7 +3934,7 @@ final class EqualizerModel: ObservableObject {
         for sampleIndex in 0..<sampleCount {
             let fraction = Double(sampleIndex) / Double(sampleCount - 1)
             let frequency = pow(10, minLog + ((maxLog - minLog) * fraction))
-            let omega = 2 * Double.pi * frequency / sampleRate.clamped(to: 8_000...384_000)
+            let omega = 2 * Double.pi * frequency / sampleRate.clamped(to: 8_000...768_000)
             let cos1 = cos(omega)
             let sin1 = sin(omega)
             let cos2 = cos(2 * omega)
@@ -3296,13 +4292,9 @@ final class EqualizerModel: ObservableObject {
     }
 
     private var virtualCaptureDeviceForEngine: AudioOutputDevice? {
-        guard !audioEngine.processTapsAvailable,
-              routingGraphHasRoutableSource,
+        guard routingGraphHasRoutableSource,
               let virtualOutput = pureQVirtualOutputDevice else {
             return nil
-        }
-        if routingGraphUsesSystemMix {
-            return virtualOutput
         }
         return virtualOutput
     }
@@ -3319,32 +4311,6 @@ final class EqualizerModel: ObservableObject {
         return sourceNodes.contains { node in
             sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency)
         }
-    }
-
-    private var routingGraphUsesSystemMix: Bool {
-        let sourceNodes = routingNodes.filter { $0.kind == .source }
-        let outputNodeIDs = Set(routingNodes.compactMap { node -> RoutingNode.ID? in
-            guard node.kind == .output, node.audioOutputUID != nil else { return nil }
-            return node.id
-        })
-        guard !sourceNodes.isEmpty, !outputNodeIDs.isEmpty else { return false }
-
-        let adjacency = Dictionary(grouping: routingConnections, by: \.from)
-        let hasSpecificSourceRoute = sourceNodes.contains { node in
-            (node.audioSourceID ?? AudioSourceItem.systemMixID) != AudioSourceItem.systemMixID &&
-            sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency)
-        }
-
-        for node in sourceNodes where (node.audioSourceID ?? AudioSourceItem.systemMixID) == AudioSourceItem.systemMixID {
-            if hasSpecificSourceRoute && node.isProtected {
-                continue
-            }
-            if sourceNode(node.id, reachesOutputIn: outputNodeIDs, adjacency: adjacency) {
-                return true
-            }
-        }
-
-        return false
     }
 
     private func sourceNode(
@@ -3476,6 +4442,30 @@ final class EqualizerModel: ObservableObject {
         let installedDriver = engineStatus.driverInstalled
 
         if bundledDriver || installedDriver {
+            if let virtualFormatMismatch = pureQVirtualOutputFormatMismatchDescription(for: audioEngineConfiguration) {
+                return TestReadinessItem(
+                    id: "driver",
+                    title: "Audio Driver",
+                    detail: virtualFormatMismatch,
+                    state: .caution
+                )
+            }
+            if installedDriver, !bundledDriver {
+                return TestReadinessItem(
+                    id: "driver",
+                    title: "Audio Driver",
+                    detail: "A PureQ HAL driver is installed, but this app build does not bundle PureQ.driver for repair.",
+                    state: .caution
+                )
+            }
+            if installedDriver, bundledDriver, installedDriverExecutableSizeDiffersFromBundledDriver() {
+                return TestReadinessItem(
+                    id: "driver",
+                    title: "Audio Driver",
+                    detail: "Installed PureQ HAL driver differs from this app build. Use Driver > Repair Driver before audio testing.",
+                    state: .caution
+                )
+            }
             return TestReadinessItem(
                 id: "driver",
                 title: "Audio Driver",
@@ -3492,6 +4482,24 @@ final class EqualizerModel: ObservableObject {
                 : "No PureQ HAL driver/helper is present, so system-wide EQ DSP is not testable yet.",
             state: engineStatus.processTapsAvailable ? .caution : .blocked
         )
+    }
+
+    private func installedDriverExecutableSizeDiffersFromBundledDriver() -> Bool {
+        guard let bundledDriverURL = Bundle.main.url(forResource: "PureQ", withExtension: "driver") else {
+            return false
+        }
+        let installedDriverURL = URL(fileURLWithPath: "/Library/Audio/Plug-Ins/HAL/PureQ.driver")
+        guard let bundledSize = driverExecutableByteCount(in: bundledDriverURL),
+              let installedSize = driverExecutableByteCount(in: installedDriverURL) else {
+            return false
+        }
+        return bundledSize != installedSize
+    }
+
+    private func driverExecutableByteCount(in bundleURL: URL) -> Int64? {
+        let executableURL = bundleURL.appendingPathComponent("Contents/MacOS/PureQ")
+        let attributes = try? FileManager.default.attributesOfItem(atPath: executableURL.path)
+        return (attributes?[.size] as? NSNumber)?.int64Value
     }
 
     private func overlappingRoutingNodePairs() -> [(RoutingNode, RoutingNode)] {

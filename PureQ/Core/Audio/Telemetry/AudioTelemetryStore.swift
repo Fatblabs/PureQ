@@ -33,6 +33,9 @@ final class AudioTelemetryStore: ObservableObject {
             bufferedFrames: snapshot.bufferedFrames,
             inputCallbacks: snapshot.inputCallbacks,
             renderCallbacks: snapshot.renderCallbacks,
+            outputPeakLevel: snapshot.outputPeakLevel,
+            clippedSampleCount: snapshot.clippedSampleCount,
+            clippedCallbackCount: snapshot.clippedCallbackCount,
             bandLevels: levels,
             spectrumLevels: spectrum
         )
@@ -115,10 +118,13 @@ final class AudioTelemetryStore: ObservableObject {
     private func shouldPublish(_ next: AudioEngineTelemetry) -> Bool {
         let levelsChanged = bandLevelsChangedSignificantly(next.bandLevels)
         let spectrumChanged = spectrumLevelsChangedSignificantly(next.spectrumLevels)
-        guard levelsChanged || spectrumChanged else { return false }
+        let clippingChanged = telemetry.clippedSampleCount != next.clippedSampleCount ||
+            telemetry.clippedCallbackCount != next.clippedCallbackCount ||
+            abs(telemetry.outputPeakDecibels - next.outputPeakDecibels) > 0.4
+        guard levelsChanged || spectrumChanged || clippingChanged else { return false }
 
         let now = Date.timeIntervalSinceReferenceDate
-        if levelsChanged || spectrumChanged || now - lastPublishTime >= 0.25 {
+        if levelsChanged || spectrumChanged || clippingChanged || now - lastPublishTime >= 0.25 {
             lastPublishTime = now
             return true
         }

@@ -43,6 +43,8 @@ struct StatusFooter: View {
             Text("Render: \(model.audioEngineRunState.title)")
                 .foregroundStyle(model.audioEngineRunState == .running ? Color.pureQGreen : .secondary)
 
+            ClipFooterIndicator(status: model.outputClippingStatus)
+
             Text(renderModeLabel)
                 .foregroundStyle(renderModeTint)
 
@@ -77,6 +79,23 @@ struct StatusFooter: View {
     }
 }
 
+struct ClipFooterIndicator: View {
+    let status: OutputClippingStatus
+
+    var body: some View {
+        switch status.risk {
+        case .clipping:
+            Label("Clipping", systemImage: "waveform.path.badge.exclamationmark")
+                .foregroundStyle(Color.pureQOrange)
+        case .hot:
+            Text(String(format: "Peak %.1fdBFS", status.peakDecibels))
+                .foregroundStyle(Color.pureQAmber)
+        case .idle, .safe:
+            EmptyView()
+        }
+    }
+}
+
 struct TelemetryFooterText: View {
     @EnvironmentObject private var telemetry: AudioTelemetryStore
     let isRunning: Bool
@@ -88,4 +107,3 @@ struct TelemetryFooterText: View {
         }
     }
 }
-

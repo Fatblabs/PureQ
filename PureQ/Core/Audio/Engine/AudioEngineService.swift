@@ -67,7 +67,9 @@ struct AudioEngineSourceRoute: Equatable {
     let sourceID: String
     let title: String
     let bundleIdentifier: String?
+    let bundleIdentifiers: [String]
     let processIdentifier: pid_t?
+    let processObjectIDs: [AudioObjectID]
     let volume: Double
     let isMuted: Bool
     let isSoloed: Bool
@@ -80,11 +82,13 @@ struct AudioEngineRoutePlan: Equatable {
     let title: String
     let bundleIdentifier: String?
     let processIdentifier: pid_t?
+    let processObjectIDs: [AudioObjectID]
     let outputUID: String?
     let outputName: String
     let nodePath: [RoutingNode.ID]
     let eqNodeIDs: [RoutingNode.ID]
     let filters: [AudioEngineFilterDescriptor]
+    let bundleIdentifiers: [String]
     let sourceGainDecibels: Double
     let isMuted: Bool
     let isSoloed: Bool
@@ -134,6 +138,9 @@ struct AudioEngineTelemetry: Equatable {
     let bufferedFrames: UInt64
     let inputCallbacks: UInt64
     let renderCallbacks: UInt64
+    let outputPeakLevel: Double
+    let clippedSampleCount: UInt64
+    let clippedCallbackCount: UInt64
     let bandLevels: [Double]
     let spectrumLevels: [Double]
 
@@ -145,9 +152,17 @@ struct AudioEngineTelemetry: Equatable {
         bufferedFrames: 0,
         inputCallbacks: 0,
         renderCallbacks: 0,
+        outputPeakLevel: 0,
+        clippedSampleCount: 0,
+        clippedCallbackCount: 0,
         bandLevels: Array(repeating: 0, count: activityMeterFrequencies.count),
         spectrumLevels: []
     )
+
+    var outputPeakDecibels: Double {
+        guard outputPeakLevel > 0 else { return -120 }
+        return 20 * log10(max(outputPeakLevel, 0.000_001))
+    }
 
     var summary: String {
         "Captured \(capturedFrames) / Rendered \(renderedFrames) / Buffered \(bufferedFrames) / Underrun \(underrunFrames)"
@@ -262,7 +277,9 @@ final class AudioEngineService {
                         sourceID: sourceID,
                         title: source?.title ?? node.title,
                         bundleIdentifier: source?.bundleIdentifier,
+                        bundleIdentifiers: source?.tapBundleIdentifiers ?? source.map { [$0.bundleIdentifier].compactMap(\.self) } ?? [],
                         processIdentifier: source?.processIdentifier,
+                        processObjectIDs: source?.processObjectIDs ?? [],
                         volume: node.sourceVolumeValue,
                         isMuted: node.sourceMutedValue,
                         isSoloed: node.sourceSoloedValue,
@@ -542,11 +559,13 @@ final class AudioEngineService {
                     title: source?.title ?? sourceNode.title,
                     bundleIdentifier: source?.bundleIdentifier,
                     processIdentifier: source?.processIdentifier,
+                    processObjectIDs: source?.processObjectIDs ?? [],
                     outputUID: outputNode?.audioOutputUID ?? fallbackOutputUID,
                     outputName: outputNode?.title ?? fallbackOutputName,
                     nodePath: path,
                     eqNodeIDs: eqNodes.map(\.id),
                     filters: routeFilters,
+                    bundleIdentifiers: source?.tapBundleIdentifiers ?? source.map { [$0.bundleIdentifier].compactMap(\.self) } ?? [],
                     sourceGainDecibels: sourceGainDecibels,
                     isMuted: sourceNode.sourceMutedValue,
                     isSoloed: sourceNode.sourceSoloedValue,

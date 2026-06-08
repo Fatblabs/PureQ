@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import CoreAudio
 import SwiftUI
 
 enum EqualizerMode: String, CaseIterable, Identifiable, Codable {
@@ -212,6 +213,7 @@ struct AudioSourceItem: Identifiable, Equatable {
     let title: String
     let bundleIdentifier: String?
     var processIdentifier: pid_t?
+    var processObjectIDs: [AudioObjectID]
     let kind: AudioSourceKind
     let systemImage: String
     var isRunning: Bool
@@ -221,6 +223,7 @@ struct AudioSourceItem: Identifiable, Equatable {
         title: String,
         bundleIdentifier: String?,
         processIdentifier: pid_t? = nil,
+        processObjectIDs: [AudioObjectID] = [],
         kind: AudioSourceKind,
         systemImage: String,
         isRunning: Bool
@@ -229,6 +232,7 @@ struct AudioSourceItem: Identifiable, Equatable {
         self.title = title
         self.bundleIdentifier = bundleIdentifier
         self.processIdentifier = processIdentifier
+        self.processObjectIDs = processObjectIDs.sorted()
         self.kind = kind
         self.systemImage = systemImage
         self.isRunning = isRunning
@@ -244,6 +248,34 @@ struct AudioSourceItem: Identifiable, Equatable {
             return isRunning ? "Running game/app" : "Game or custom app"
         case .browser:
             return isRunning ? "Running browser" : "Browser source"
+        }
+    }
+
+    var tapBundleIdentifiers: [String] {
+        guard let bundleIdentifier else { return [] }
+        switch bundleIdentifier {
+        case "com.apple.Safari":
+            return [
+                "com.apple.Safari",
+                "com.apple.WebKit.WebContent",
+                "com.apple.WebKit.GPU"
+            ]
+        case "com.google.Chrome":
+            return [
+                "com.google.Chrome",
+                "com.google.Chrome.helper",
+                "com.google.Chrome.helper.renderer",
+                "com.google.Chrome.helper.gpu",
+                "com.google.Chrome.helper.plugin"
+            ]
+        default:
+            if bundleIdentifier.localizedCaseInsensitiveContains("firefox") {
+                return [
+                    bundleIdentifier,
+                    "org.mozilla.plugincontainer"
+                ]
+            }
+            return [bundleIdentifier]
         }
     }
 
@@ -342,6 +374,50 @@ struct EQClippingStatus: Equatable {
     var risk: EQClippingRisk {
         if peakDecibels > 0.05 { return .clipping }
         if peakDecibels > -1.0 { return .caution }
+        return .safe
+    }
+
+    var headroomDecibels: Double {
+        max(0, -peakDecibels)
+    }
+
+    var clipAmountDecibels: Double {
+        max(0, peakDecibels)
+    }
+}
+
+enum OutputClippingRisk: Equatable {
+    case idle
+    case safe
+    case hot
+    case clipping
+}
+
+struct OutputClippingStatus: Equatable {
+    let peakDecibels: Double
+    let totalClippedSamples: UInt64
+    let totalClipEvents: UInt64
+    let recentClippedSamples: UInt64
+    let isClipHeld: Bool
+
+    static let empty = OutputClippingStatus(
+        peakDecibels: -120,
+        totalClippedSamples: 0,
+        totalClipEvents: 0,
+        recentClippedSamples: 0,
+        isClipHeld: false
+    )
+
+    var risk: OutputClippingRisk {
+        if isClipHeld || recentClippedSamples > 0 {
+            return .clipping
+        }
+        if peakDecibels <= -90 {
+            return .idle
+        }
+        if peakDecibels > -1.0 {
+            return .hot
+        }
         return .safe
     }
 

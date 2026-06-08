@@ -15,7 +15,19 @@ struct PureQBiquadCoefficients: Equatable {
     let a2: Double
 
     var isUsable: Bool {
-        b0.isFinite && b1.isFinite && b2.isFinite && a1.isFinite && a2.isFinite
+        b0.isFinite &&
+            b1.isFinite &&
+            b2.isFinite &&
+            a1.isFinite &&
+            a2.isFinite &&
+            isStable
+    }
+
+    private var isStable: Bool {
+        let epsilon = 1e-9
+        return (1 + a1 + a2) > epsilon &&
+            (1 - a1 + a2) > epsilon &&
+            (1 - a2) > epsilon
     }
 
     func magnitudeDecibels(at frequency: Double, sampleRate: Double) -> Double {
@@ -59,7 +71,7 @@ enum PureQBiquadMath {
         q: Double,
         gain: Double
     ) -> PureQBiquadCoefficients? {
-        let rate = sampleRate.clamped(to: 8_000...384_000)
+        let rate = sampleRate.clamped(to: 8_000...768_000)
         let resolvedFrequency = frequency.clamped(to: 1...(rate * 0.49))
         let resolvedQ = q.clamped(to: 0.1...100)
         let resolvedGain = gain.clamped(to: -36...36)

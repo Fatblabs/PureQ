@@ -78,6 +78,8 @@ final class PureQWindowController: NSObject, NSWindowDelegate {
 
 @MainActor
 final class PureQAppDelegate: NSObject, NSApplicationDelegate {
+    private var isTerminatingDuplicateInstance = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !activateExistingInstanceAndQuitIfNeeded() else {
             return
@@ -101,6 +103,7 @@ final class PureQAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !isTerminatingDuplicateInstance else { return }
         PureQAppStore.model.prepareForApplicationExit()
     }
 
@@ -117,6 +120,7 @@ final class PureQAppDelegate: NSObject, NSApplicationDelegate {
         }
 
         existingApplication.activate(options: [.activateAllWindows])
+        isTerminatingDuplicateInstance = true
         NSApplication.shared.terminate(nil)
         return true
     }

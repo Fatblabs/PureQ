@@ -32,9 +32,22 @@ Pre-built releases are the recommended way to use PureQ. Install PureQ from the 
 2. Download the latest `PureQ-<version>.pkg`.
 3. Open the `.pkg` and follow the installer prompts.
 4. Launch PureQ from `/Applications`.
-5. If macOS blocks the test build, right-click the installer or app and choose Open, then confirm in System Settings → Privacy & Security if prompted.
+5. If macOS blocks the unsigned community build, right-click the installer and choose Open, then confirm in System Settings → Privacy & Security if prompted.
+
+PureQ release packages are built to work without an Apple Developer ID. Unsigned builds may show `no signature` in `pkgutil`; that is expected and does not mean the installer is corrupted. If double-clicking is blocked, install from Terminal:
+
+```bash
+sudo installer -pkg PureQ-<version>.pkg -target /
+```
 
 The `.pkg` installer is required for normal installs because PureQ includes a CoreAudio HAL driver. Dragging only `PureQ.app` into `/Applications` does not install the audio driver and can cause missing audio routing behavior.
+
+After install/repair and while PureQ is running, macOS should expose `PureQ Virtual Output` as the system output device. PureQ hides that virtual output when the app quits. PureQ keeps its own routing/output nodes pointed at normal hardware devices, so a typical setup is:
+
+- macOS Sound Output: `PureQ Virtual Output`
+- PureQ Routing Output Node: `MacBook Pro Speakers`, a DAC, headphones, or another normal hardware output
+
+The installer also adds a small user-session recovery helper. If PureQ is force-quit while the virtual output is still selected, the helper restores the last known hardware output and hides `PureQ Virtual Output` shortly afterward.
 
 ---
 
@@ -65,7 +78,7 @@ This builds PureQ, installs `/Applications/PureQ.app`, installs `/Library/Audio/
 Notes for developers:
 
 - The Xcode workspace contains two primary targets: the SwiftUI app and a small C-based driver (`PureQDriver`).
-- Building and embedding the driver requires proper code signing for distribution. For local testing the script places the driver under `/Library/Audio/Plug-Ins/HAL/`.
+- Paid Developer ID signing is optional. The local and GitHub release scripts ad-hoc sign the app and driver when no signing identity is provided, then install the driver under `/Library/Audio/Plug-Ins/HAL/`.
 
 ---
 

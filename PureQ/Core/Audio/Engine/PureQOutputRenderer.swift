@@ -17,7 +17,7 @@ final class PureQOutputRenderer {
     )
 
     private var audioUnit: AudioComponentInstance?
-    private var recordRender: ((AVAudioFrameCount, UInt32) -> Void)?
+    private var recordRender: ((AVAudioFrameCount, UInt32, Float, UInt32) -> Void)?
     private var recordCapture: ((UInt32) -> Void)?
     private var observeInput: ((UnsafePointer<AudioBufferList>, UInt32) -> Void)?
     private let configurationLock = NSLock()
@@ -44,6 +44,10 @@ final class PureQOutputRenderer {
         return ringBuffer.availableFrameCount
     }
 
+    var outputUID: String {
+        lastStagedTarget?.outputUID ?? ""
+    }
+
     func start(
         target: AudioEngineRenderTarget,
         enabled: Bool,
@@ -52,7 +56,7 @@ final class PureQOutputRenderer {
         driverCaptureReader: PureQDriverSharedMemoryReader? = nil,
         recordCapture: @escaping (UInt32) -> Void,
         observeInput: @escaping (UnsafePointer<AudioBufferList>, UInt32) -> Void,
-        recordRender: @escaping (AVAudioFrameCount, UInt32) -> Void
+        recordRender: @escaping (AVAudioFrameCount, UInt32, Float, UInt32) -> Void
     ) throws {
         stop()
         isStopping = false
@@ -68,7 +72,7 @@ final class PureQOutputRenderer {
             try configureHALOutputUnit(
                 unit,
                 outputDeviceID: outputDeviceID,
-                sampleRate: sampleRate.clamped(to: 8_000...384_000)
+                sampleRate: sampleRate.clamped(to: 8_000...768_000)
             )
             try startHALOutputUnit(unit)
         } catch {
@@ -107,8 +111,26 @@ final class PureQOutputRenderer {
         stageConfiguration(target: target, enabled: enabled, sampleRate: renderState.sampleRate)
     }
 
+    func suspendOutput() {
+        guard let target = lastStagedTarget else {
+            return
+        }
+
+        let silentTarget = AudioEngineRenderTarget(
+            outputUID: target.outputUID,
+            outputName: target.outputName,
+            routeCount: 0,
+            filters: [],
+            preamp: -80,
+            balance: target.balance,
+            systemVolume: 0,
+            systemMuted: true
+        )
+        stageConfiguration(target: silentTarget, enabled: true, sampleRate: renderState.sampleRate)
+    }
+
     private func stageConfiguration(target: AudioEngineRenderTarget, enabled: Bool, sampleRate: Double) {
-        let resolvedSampleRate = sampleRate.clamped(to: 8_000...384_000)
+        let resolvedSampleRate = sampleRate.clamped(to: 8_000...768_000)
         configurationLock.lock()
         if lastStagedTarget == target,
            lastStagedEnabled == enabled,
@@ -201,6 +223,16 @@ final class PureQOutputRenderer {
             throw PureQAudioEngineError.outputAudioUnitFormatFailed(formatStatus)
         }
 
+        var maximumFramesPerSlice = Self.preferredMaximumFramesPerSlice(for: sampleRate)
+        _ = AudioUnitSetProperty(
+            unit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &maximumFramesPerSlice,
+            UInt32(MemoryLayout<UInt32>.size)
+        )
+
         var callback = AURenderCallbackStruct(
             inputProc: Self.renderCallback,
             inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -216,6 +248,15 @@ final class PureQOutputRenderer {
         guard callbackStatus == noErr else {
             throw PureQAudioEngineError.outputAudioUnitCallbackFailed(callbackStatus)
         }
+    }
+
+    private static func preferredMaximumFramesPerSlice(for sampleRate: Double) -> UInt32 {
+        let targetFrames = Int((sampleRate.clamped(to: 44_100...768_000) / 100).rounded(.up))
+        var powerOfTwo = 512
+        while powerOfTwo < targetFrames, powerOfTwo < 4_096 {
+            powerOfTwo <<= 1
+        }
+        return UInt32(powerOfTwo.clamped(to: 512...4_096))
     }
 
     private func startHALOutputUnit(_ unit: AudioComponentInstance) throws {
@@ -243,7 +284,7 @@ final class PureQOutputRenderer {
     private func render(into ioData: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) -> OSStatus {
         guard !isStopping else {
             PureQAudioBufferTools.fillSilence(ioData, frameCount: frameCount)
-            recordRender?(AVAudioFrameCount(frameCount), 0)
+            recordRender?(AVAudioFrameCount(frameCount), 0, 0, 0)
             return noErr
         }
 
@@ -254,7 +295,7 @@ final class PureQOutputRenderer {
             renderedFrameCount = driverCaptureReader.read(into: ioData, frameCount: frameCount)
             if renderedFrameCount > 0 {
                 observeInput?(UnsafePointer(ioData), renderedFrameCount)
-                recordCapture?(renderedFrameCount)
+                recordCapture?(driverCaptureReader.consumedFrameCount)
             }
         } else {
             renderedFrameCount = ringBuffer.read(
@@ -264,11 +305,17 @@ final class PureQOutputRenderer {
             )
         }
 
+        var metering = PureQRenderMetering.silent
         if renderedFrameCount > 0 {
-            renderState.process(ioData, frameCount: renderedFrameCount)
+            metering = renderState.process(ioData, frameCount: renderedFrameCount)
         }
 
-        recordRender?(AVAudioFrameCount(frameCount), renderedFrameCount)
+        recordRender?(
+            AVAudioFrameCount(frameCount),
+            renderedFrameCount,
+            metering.peakLevel,
+            metering.clippedSampleCount
+        )
         return noErr
     }
 
@@ -294,7 +341,7 @@ private struct PureQRendererConfiguration {
     let sampleRate: Double
 
     init(target: AudioEngineRenderTarget, enabled: Bool, sampleRate: Double) {
-        let resolvedSampleRate = sampleRate.clamped(to: 8_000...384_000)
+        let resolvedSampleRate = sampleRate.clamped(to: 8_000...768_000)
         self.enabled = enabled
         filters = target.filters.compactMap { descriptor in
             PureQBiquad(descriptor: descriptor, sampleRate: resolvedSampleRate)
@@ -304,6 +351,32 @@ private struct PureQRendererConfiguration {
         systemVolume = target.systemVolume.clamped(to: 0...1)
         systemMuted = target.systemMuted
         self.sampleRate = resolvedSampleRate
+    }
+}
+
+private struct PureQRenderMetering {
+    static let silent = PureQRenderMetering(peakLevel: 0, clippedSampleCount: 0)
+
+    var peakLevel: Float = 0
+    var clippedSampleCount: UInt32 = 0
+
+    mutating func observe(left: Float, right: Float) {
+        observe(sample: left)
+        observe(sample: right)
+    }
+
+    private mutating func observe(sample: Float) {
+        guard sample.isFinite else {
+            peakLevel = .infinity
+            clippedSampleCount += 1
+            return
+        }
+
+        let level = abs(sample)
+        peakLevel = max(peakLevel, level)
+        if level >= 0.999_9 {
+            clippedSampleCount += 1
+        }
     }
 }
 
@@ -342,51 +415,60 @@ private struct PureQRenderState {
             currentBalance = targetBalance
             currentSystemGain = targetSystemGain
             hasConfigured = true
+        } else if targetSystemGain <= 0.000_1 {
+            currentSystemGain = 0
         }
     }
 
-    mutating func process(_ ioData: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) {
+    mutating func process(_ ioData: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) -> PureQRenderMetering {
         let buffers = UnsafeMutableAudioBufferListPointer(ioData)
-        guard frameCount > 0, !buffers.isEmpty else { return }
+        guard frameCount > 0, !buffers.isEmpty else { return .silent }
 
         if buffers.count == 1 {
-            processInterleaved(buffer: buffers[0], frameCount: Int(frameCount))
+            return processInterleaved(buffer: buffers[0], frameCount: Int(frameCount))
         } else {
-            processNonInterleaved(buffers: buffers, frameCount: Int(frameCount))
+            return processNonInterleaved(buffers: buffers, frameCount: Int(frameCount))
         }
     }
 
-    private mutating func processInterleaved(buffer: AudioBuffer, frameCount: Int) {
-        guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { return }
+    private mutating func processInterleaved(buffer: AudioBuffer, frameCount: Int) -> PureQRenderMetering {
+        guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { return .silent }
         let channelCount = Int(max(buffer.mNumberChannels, 1))
+        var metering = PureQRenderMetering.silent
         for frame in 0..<frameCount {
             let base = frame * channelCount
             var left = data[base]
             var right = channelCount > 1 ? data[base + 1] : left
-            processFrame(left: &left, right: &right)
+            processFrame(left: &left, right: &right, metering: &metering)
             data[base] = left
             if channelCount > 1 {
                 data[base + 1] = right
             }
         }
+        return metering
     }
 
-    private mutating func processNonInterleaved(buffers: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
-        guard let leftData = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+    private mutating func processNonInterleaved(
+        buffers: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int
+    ) -> PureQRenderMetering {
+        guard let leftData = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return .silent }
         let rightData = buffers.count > 1
             ? buffers[1].mData?.assumingMemoryBound(to: Float.self)
             : nil
 
+        var metering = PureQRenderMetering.silent
         for frame in 0..<frameCount {
             var left = leftData[frame]
             var right = rightData?[frame] ?? left
-            processFrame(left: &left, right: &right)
+            processFrame(left: &left, right: &right, metering: &metering)
             leftData[frame] = left
             rightData?[frame] = right
         }
+        return metering
     }
 
-    private mutating func processFrame(left: inout Float, right: inout Float) {
+    private mutating func processFrame(left: inout Float, right: inout Float, metering: inout PureQRenderMetering) {
         let smoothing: Float = 0.0015
         currentPreampGain += (targetPreampGain - currentPreampGain) * smoothing
         currentBalance += (targetBalance - currentBalance) * smoothing
@@ -408,36 +490,49 @@ private struct PureQRenderState {
 
         left *= currentSystemGain
         right *= currentSystemGain
+
+        metering.observe(left: left, right: right)
+        sanitizeFinalOutput(&left)
+        sanitizeFinalOutput(&right)
+    }
+
+    private func sanitizeFinalOutput(_ sample: inout Float) {
+        guard sample.isFinite else {
+            sample = 0
+            return
+        }
+
+        sample = sample.clamped(to: -1...1)
     }
 }
 
 private struct PureQBiquad {
     let sourceID: EqualizerBand.ID
-    private let b0: Float
-    private let b1: Float
-    private let b2: Float
-    private let a1: Float
-    private let a2: Float
-    private var leftZ1: Float = 0
-    private var leftZ2: Float = 0
-    private var rightZ1: Float = 0
-    private var rightZ2: Float = 0
+    private let b0: Double
+    private let b1: Double
+    private let b2: Double
+    private let a1: Double
+    private let a2: Double
+    private var leftZ1: Double = 0
+    private var leftZ2: Double = 0
+    private var rightZ1: Double = 0
+    private var rightZ2: Double = 0
 
     init?(descriptor: AudioEngineFilterDescriptor, sampleRate: Double) {
         guard abs(descriptor.gain) > 0.01 || descriptor.shape == .notch else {
             return nil
         }
-        let rate = sampleRate.clamped(to: 8_000...384_000)
+        let rate = sampleRate.clamped(to: 8_000...768_000)
         guard let coefficients = PureQBiquadMath.coefficients(for: descriptor, sampleRate: rate) else {
             return nil
         }
 
         sourceID = descriptor.id
-        b0 = Float(coefficients.b0)
-        b1 = Float(coefficients.b1)
-        b2 = Float(coefficients.b2)
-        a1 = Float(coefficients.a1)
-        a2 = Float(coefficients.a2)
+        b0 = coefficients.b0
+        b1 = coefficients.b1
+        b2 = coefficients.b2
+        a1 = coefficients.a1
+        a2 = coefficients.a2
     }
 
     mutating func process(left: inout Float, right: inout Float) {
@@ -472,25 +567,31 @@ private struct PureQBiquad {
 
     private static func processSample(
         _ input: Float,
-        b0: Float,
-        b1: Float,
-        b2: Float,
-        a1: Float,
-        a2: Float,
-        z1: inout Float,
-        z2: inout Float
+        b0: Double,
+        b1: Double,
+        b2: Double,
+        a1: Double,
+        a2: Double,
+        z1: inout Double,
+        z2: inout Double
     ) -> Float {
+        let input = Double(input)
         let output = (b0 * input) + z1
         let nextZ1 = (b1 * input) - (a1 * output) + z2
         let nextZ2 = (b2 * input) - (a2 * output)
-        guard output.isFinite, nextZ1.isFinite, nextZ2.isFinite else {
+        guard output.isFinite,
+              nextZ1.isFinite,
+              nextZ2.isFinite,
+              abs(output) < 128,
+              abs(nextZ1) < 128,
+              abs(nextZ2) < 128 else {
             z1 = 0
             z2 = 0
             return 0
         }
         z1 = nextZ1
         z2 = nextZ2
-        return output
+        return Float(output)
     }
 }
 

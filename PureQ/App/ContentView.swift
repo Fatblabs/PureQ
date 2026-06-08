@@ -8,6 +8,7 @@ import SwiftUI
 enum WorkspaceTab: String, CaseIterable, Identifiable {
     case equalizer = "Equalizer"
     case routing = "Routing"
+    case debug = "Debug"
     case about = "About"
 
     var id: String { rawValue }
@@ -16,6 +17,7 @@ enum WorkspaceTab: String, CaseIterable, Identifiable {
         switch self {
         case .equalizer: return "slider.horizontal.3"
         case .routing: return "point.topleft.down.curvedto.point.bottomright.up"
+        case .debug: return "ladybug"
         case .about: return "info.circle"
         }
     }
@@ -38,6 +40,8 @@ struct ContentView: View {
                     EqualizerWorkspace()
                 case .routing:
                     RoutingWorkspace()
+                case .debug:
+                    DebugWorkspace()
                 case .about:
                     AboutWorkspace()
                 }
@@ -84,6 +88,8 @@ struct ContentView: View {
             return .equalizer
         case .routing:
             return .routing
+        case .debug:
+            return nil
         case .about:
             return nil
         }

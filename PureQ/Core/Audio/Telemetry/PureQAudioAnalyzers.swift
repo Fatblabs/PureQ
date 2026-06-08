@@ -25,7 +25,7 @@ final class PureQBandLevelAnalyzer {
     }
 
     func configure(sampleRate: Double, frameRate: Double = 30) {
-        let nextSampleRate = sampleRate.clamped(to: 8_000...384_000)
+        let nextSampleRate = sampleRate.clamped(to: 8_000...768_000)
         let nextFrameRate = frameRate.clamped(to: 15...60)
         lock.lock()
         let sampleRateChanged = abs(self.sampleRate - nextSampleRate) > 0.5
@@ -188,7 +188,7 @@ final class PureQSpectrumAnalyzer {
     }
 
     func configure(sampleRate: Double, frameRate: Double = 30) {
-        let nextSampleRate = sampleRate.clamped(to: 8_000...384_000)
+        let nextSampleRate = sampleRate.clamped(to: 8_000...768_000)
         let nextFrameRate = frameRate.clamped(to: 15...60)
         lock.lock()
         let sampleRateChanged = abs(self.sampleRate - nextSampleRate) > 0.5

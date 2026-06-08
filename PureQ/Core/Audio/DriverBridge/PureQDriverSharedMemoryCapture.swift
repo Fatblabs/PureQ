@@ -12,7 +12,7 @@ private enum PureQSharedAudioLayout {
     static let magic: UInt32 = 0x50555251
     static let version: UInt32 = 1
     static let fallbackPath = "/tmp/PureQAudioRing.v1"
-    static let capacityFrames: UInt32 = 384_000 * 2
+    static let capacityFrames: UInt32 = 65_536
     static let channelCount: UInt32 = 2
     static let headerSize = 64
     static let samplesOffset = 64
@@ -89,9 +89,13 @@ final class PureQDriverSharedMemoryCapture: @unchecked Sendable {
         }
     }
 
-    func makeReader() -> PureQDriverSharedMemoryReader? {
+    func makeReader(outputSampleRate: Double) -> PureQDriverSharedMemoryReader? {
         guard let mappedAddress else { return nil }
-        return PureQDriverSharedMemoryReader(capture: self, mappedAddress: mappedAddress)
+        return PureQDriverSharedMemoryReader(
+            capture: self,
+            mappedAddress: mappedAddress,
+            outputSampleRate: outputSampleRate
+        )
     }
 
     func disconnect() {
@@ -116,13 +120,15 @@ final class PureQDriverSharedMemoryCapture: @unchecked Sendable {
     }
 
     private func createAppOwnedMapping() throws {
-        let capturePath = "/tmp/pureq-audio-\(getpid()).shm"
-        unlink(capturePath)
-
-        let fd = open(capturePath, O_CREAT | O_RDWR, 0o666)
+        var pathTemplate = Array("/tmp/pureq-audio-\(getpid())-XXXXXX.shm".utf8CString)
+        let fd = pathTemplate.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            guard let baseAddress = buffer.baseAddress else { return -1 }
+            return mkstemps(baseAddress, 4)
+        }
         guard fd >= 0 else {
             throw PureQDriverCaptureError.createFailed(errno)
         }
+        let capturePath = String(cString: pathTemplate)
 
         let size = PureQSharedAudioLayout.totalSize
         guard ftruncate(fd, off_t(size)) == 0 else {
@@ -217,13 +223,16 @@ final class PureQDriverSharedMemoryCapture: @unchecked Sendable {
 final class PureQDriverSharedMemoryReader: @unchecked Sendable {
     private let capture: PureQDriverSharedMemoryCapture
     private let mappedAddress: UnsafeMutableRawPointer
+    private let outputSampleRate: Double
     private nonisolated(unsafe) var readCounter: UInt64 = 0
     private nonisolated(unsafe) var firstPoll = true
+    private nonisolated(unsafe) var lastConsumedFrameCount: UInt32 = 0
     private nonisolated(unsafe) var overflowCount: UInt64 = 0
 
-    init(capture: PureQDriverSharedMemoryCapture, mappedAddress: UnsafeMutableRawPointer) {
+    init(capture: PureQDriverSharedMemoryCapture, mappedAddress: UnsafeMutableRawPointer, outputSampleRate: Double) {
         self.capture = capture
         self.mappedAddress = mappedAddress
+        self.outputSampleRate = outputSampleRate.clamped(to: 8_000...768_000)
     }
 
     var availableFrameCount: Int {
@@ -232,10 +241,15 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
         return Int(min(UInt64(PureQSharedAudioLayout.capacityFrames), writeCounter - readCounter))
     }
 
+    var consumedFrameCount: UInt32 {
+        lastConsumedFrameCount
+    }
+
     @inline(__always)
     func read(into outputData: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) -> UInt32 {
         let requestedFrames = Int(frameCount)
         guard requestedFrames > 0 else { return 0 }
+        lastConsumedFrameCount = 0
 
         let magic = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.magicOffset)
         let version = mappedAddress.loadAtomicUInt32(offset: PureQSharedAudioLayout.versionOffset)
@@ -248,6 +262,16 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
               version == PureQSharedAudioLayout.version,
               channels == PureQSharedAudioLayout.channelCount,
               capacity == PureQSharedAudioLayout.capacityFrames else {
+            zeroFill(outputData, frameOffset: 0, frameCount: requestedFrames)
+            return 0
+        }
+
+        let sourceSampleRate = mappedAddress
+            .loadFloat64(offset: PureQSharedAudioLayout.sampleRateOffset)
+            .clamped(to: 8_000...768_000)
+
+        guard sampleRatesMatch(sourceSampleRate, outputSampleRate) else {
+            readCounter = writeCounter
             zeroFill(outputData, frameOffset: 0, frameCount: requestedFrames)
             return 0
         }
@@ -287,60 +311,72 @@ final class PureQDriverSharedMemoryReader: @unchecked Sendable {
         let samples = mappedAddress
             .advanced(by: PureQSharedAudioLayout.samplesOffset)
             .assumingMemoryBound(to: Float.self)
-        copyFrames(from: samples, into: outputData, startFrame: readCounter, frameCount: framesToRead)
-        readCounter += UInt64(framesToRead)
 
-        if framesToRead < requestedFrames {
-            zeroFill(outputData, frameOffset: framesToRead, frameCount: requestedFrames - framesToRead)
+        let capacityFrames = UInt64(capacity)
+        var localReadCounter = readCounter
+        for frame in 0..<framesToRead {
+            let currentFrame = Int(localReadCounter % capacityFrames)
+            let currentOffset = currentFrame * Int(channels)
+            let left = sanitizedSample(samples[currentOffset])
+            let right = sanitizedSample(samples[currentOffset + 1])
+            writeFrame(left: left, right: right, into: outputData, frame: frame)
+            localReadCounter &+= 1
         }
 
+        readCounter = localReadCounter
+        lastConsumedFrameCount = UInt32(framesToRead.clamped(to: 0...Int(UInt32.max)))
+        if framesToRead < requestedFrames {
+            zeroFill(outputData, frameOffset: framesToRead, frameCount: requestedFrames - framesToRead)
+        } else {
+            updateByteSizes(outputData, frameCount: requestedFrames)
+        }
         return UInt32(framesToRead)
     }
 
     @inline(__always)
-    private func copyFrames(
-        from samples: UnsafePointer<Float>,
+    private func writeFrame(
+        left: Float,
+        right: Float,
         into outputData: UnsafeMutablePointer<AudioBufferList>,
-        startFrame: UInt64,
-        frameCount: Int
+        frame: Int
     ) {
         let buffers = UnsafeMutableAudioBufferListPointer(outputData)
-        let capacity = UInt64(PureQSharedAudioLayout.capacityFrames)
-
         if buffers.count == 1 {
             guard let data = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
             let channelCount = Int(max(buffers[0].mNumberChannels, 1))
-            for frame in 0..<frameCount {
-                let sourceFrame = Int((startFrame + UInt64(frame)) % capacity)
-                let sourceOffset = sourceFrame * 2
-                let targetOffset = frame * channelCount
-                data[targetOffset] = samples[sourceOffset]
-                if channelCount > 1 {
-                    data[targetOffset + 1] = samples[sourceOffset + 1]
-                }
-                if channelCount > 2 {
-                    for channel in 2..<channelCount {
-                        data[targetOffset + channel] = 0
-                    }
+            let targetOffset = frame * channelCount
+            data[targetOffset] = left
+            if channelCount > 1 {
+                data[targetOffset + 1] = right
+            }
+            if channelCount > 2 {
+                for channel in 2..<channelCount {
+                    data[targetOffset + channel] = 0
                 }
             }
         } else {
-            let leftData = buffers[0].mData?.assumingMemoryBound(to: Float.self)
-            let rightData = buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
-            for frame in 0..<frameCount {
-                let sourceFrame = Int((startFrame + UInt64(frame)) % capacity)
-                let sourceOffset = sourceFrame * 2
-                leftData?[frame] = samples[sourceOffset]
-                rightData?[frame] = samples[sourceOffset + 1]
-                if buffers.count > 2 {
-                    for bufferIndex in 2..<buffers.count {
-                        buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self)[frame] = 0
-                    }
+            buffers[0].mData?.assumingMemoryBound(to: Float.self)[frame] = left
+            if buffers.count > 1 {
+                buffers[1].mData?.assumingMemoryBound(to: Float.self)[frame] = right
+            }
+            if buffers.count > 2 {
+                for bufferIndex in 2..<buffers.count {
+                    buffers[bufferIndex].mData?.assumingMemoryBound(to: Float.self)[frame] = 0
                 }
             }
         }
+    }
 
-        updateByteSizes(outputData, frameCount: frameCount)
+    @inline(__always)
+    private func sanitizedSample(_ sample: Float) -> Float {
+        guard sample.isFinite else { return 0 }
+        return sample.clamped(to: -1...1)
+    }
+
+    @inline(__always)
+    private func sampleRatesMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        let tolerance = max(5.0, max(abs(lhs), abs(rhs)) * 0.000_05)
+        return abs(lhs - rhs) <= tolerance
     }
 
     @inline(__always)
@@ -386,6 +422,10 @@ private extension UnsafeMutableRawPointer {
 
     func loadUInt64(offset: Int) -> UInt64 {
         advanced(by: offset).assumingMemoryBound(to: UInt64.self).pointee
+    }
+
+    func loadFloat64(offset: Int) -> Float64 {
+        advanced(by: offset).assumingMemoryBound(to: Float64.self).pointee
     }
 
     func storeUInt32(_ value: UInt32, offset: Int) {

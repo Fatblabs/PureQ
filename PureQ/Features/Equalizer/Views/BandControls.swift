@@ -64,57 +64,128 @@ struct PreampRow: View {
             .font(.callout.weight(.semibold))
             .help("Automatically lower preamp to offset the largest enabled boost")
 
-            EQClippingIndicator(status: model.activeEQClippingStatus)
+            EQClippingIndicator(
+                estimatedStatus: model.activeEQClippingStatus,
+                outputStatus: model.outputClippingStatus
+            )
         }
     }
 }
 
 struct EQClippingIndicator: View {
-    let status: EQClippingStatus
+    let estimatedStatus: EQClippingStatus
+    let outputStatus: OutputClippingStatus
 
     var body: some View {
         Label(label, systemImage: systemImage)
             .font(.caption.monospacedDigit().weight(.bold))
             .foregroundStyle(tint)
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.top, 5)
+            .padding(.bottom, 8)
             .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .stroke(tint.opacity(0.38), lineWidth: 1)
             )
+            .overlay(alignment: .bottom) {
+                ClipPeakBar(level: peakMeterLevel, tint: tint)
+                    .padding(.horizontal, 5)
+                    .padding(.bottom, 3)
+            }
             .help(helpText)
     }
 
     private var label: String {
-        switch status.risk {
-        case .safe:
-            return String(format: "Headroom %.1fdB", status.headroomDecibels)
-        case .caution:
-            return String(format: "Near clip %.1fdB", status.peakDecibels)
+        switch outputStatus.risk {
         case .clipping:
-            return String(format: "Clip +%.1fdB", status.clipAmountDecibels)
+            if outputStatus.clipAmountDecibels > 0.05 {
+                return String(format: "Clip +%.1fdB", outputStatus.clipAmountDecibels)
+            }
+            return "Clip detected"
+        case .hot:
+            return String(format: "Peak %.1fdBFS", outputStatus.peakDecibels)
+        case .idle, .safe:
+            switch estimatedStatus.risk {
+            case .clipping:
+                return String(format: "Risk +%.1fdB", estimatedStatus.clipAmountDecibels)
+            case .caution:
+                return String(format: "Risk %.1fdB", estimatedStatus.peakDecibels)
+            case .safe:
+                if outputStatus.risk == .safe {
+                    return String(format: "Peak %.1fdBFS", outputStatus.peakDecibels)
+                }
+                return String(format: "Headroom %.1fdB", estimatedStatus.headroomDecibels)
+            }
+        }
+    }
+
+    private var displayRisk: OutputClippingRisk {
+        switch outputStatus.risk {
+        case .clipping:
+            return .clipping
+        case .hot:
+            return .hot
+        case .safe:
+            return estimatedStatus.risk == .safe ? .safe : .hot
+        case .idle:
+            return estimatedStatus.risk == .safe ? .idle : .hot
         }
     }
 
     private var systemImage: String {
-        switch status.risk {
-        case .safe: return "checkmark.circle.fill"
-        case .caution: return "exclamationmark.triangle.fill"
+        switch displayRisk {
+        case .idle, .safe: return "checkmark.circle.fill"
+        case .hot: return "exclamationmark.triangle.fill"
         case .clipping: return "waveform.path.badge.exclamationmark"
         }
     }
 
     private var tint: Color {
-        switch status.risk {
-        case .safe: return Color.pureQGreen
-        case .caution: return Color.pureQAmber
+        switch displayRisk {
+        case .idle, .safe: return Color.pureQGreen
+        case .hot: return Color.pureQAmber
         case .clipping: return Color.pureQOrange
         }
     }
 
     private var helpText: String {
-        "Estimated peak EQ gain after preamp. Positive values can clip full-scale audio."
+        String(
+            format: "Measured rendered peak: %.1fdBFS. Estimated EQ peak after preamp: %.1fdB. Clip callbacks: %llu, clipped samples: %llu.",
+            outputStatus.peakDecibels,
+            estimatedStatus.peakDecibels,
+            outputStatus.totalClipEvents,
+            outputStatus.totalClippedSamples
+        )
+    }
+
+    private var peakMeterLevel: Double {
+        let decibels: Double
+        if outputStatus.risk == .idle {
+            decibels = estimatedStatus.peakDecibels
+        } else {
+            decibels = outputStatus.peakDecibels
+        }
+        return ((decibels + 48) / 48).clamped(to: 0...1)
+    }
+}
+
+private struct ClipPeakBar: View {
+    let level: Double
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width * CGFloat(level), 2)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.black.opacity(0.30))
+                Capsule()
+                    .fill(tint.opacity(0.82))
+                    .frame(width: width)
+            }
+        }
+        .frame(height: 3)
     }
 }
 

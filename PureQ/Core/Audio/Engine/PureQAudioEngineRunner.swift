@@ -25,6 +25,7 @@ enum PureQAudioEngineError: LocalizedError {
     case outputAudioUnitCallbackFailed(OSStatus)
     case outputAudioUnitStartFailed(OSStatus)
     case outputAudioUnitUnavailable
+    case outputSampleRateMismatch(String)
 
     var errorDescription: String? {
         switch self {
@@ -60,6 +61,8 @@ enum PureQAudioEngineError: LocalizedError {
             return "PureQ's HAL output renderer could not start. OSStatus \(status)."
         case .outputAudioUnitUnavailable:
             return "PureQ's HAL output audio unit is unavailable."
+        case .outputSampleRateMismatch(let message):
+            return message
         }
     }
 }
@@ -86,6 +89,9 @@ final class PureQAudioEngineRunner {
     private var underrunFrames: UInt64 = 0
     private var inputCallbacks: UInt64 = 0
     private var renderCallbacks: UInt64 = 0
+    private var outputPeakLevelSinceLastSnapshot: Double = 0
+    private var clippedSampleCount: UInt64 = 0
+    private var clippedCallbackCount: UInt64 = 0
     private var currentRenderSampleRate: Double = 48_000
     private let bandAnalyzer = PureQBandLevelAnalyzer(frequencies: AudioEngineTelemetry.activityMeterFrequencies)
     private let spectrumAnalyzer = PureQSpectrumAnalyzer()
@@ -107,6 +113,8 @@ final class PureQAudioEngineRunner {
         let bandLevels = meterFlags.bandMetersEnabled ? bandAnalyzer.levelSnapshot() : []
         let spectrumLevels = meterFlags.spectrumAnalyzerEnabled ? spectrumAnalyzer.levelSnapshot() : []
         telemetryLock.lock()
+            let peakLevel = outputPeakLevelSinceLastSnapshot
+            outputPeakLevelSinceLastSnapshot = 0
             let snapshot = AudioEngineTelemetry(
                 sampleRate: currentRenderSampleRate,
                 capturedFrames: capturedFrames,
@@ -115,6 +123,9 @@ final class PureQAudioEngineRunner {
                 bufferedFrames: bufferedFrames,
                 inputCallbacks: inputCallbacks,
                 renderCallbacks: renderCallbacks,
+                outputPeakLevel: peakLevel,
+                clippedSampleCount: clippedSampleCount,
+                clippedCallbackCount: clippedCallbackCount,
                 bandLevels: bandLevels,
                 spectrumLevels: spectrumLevels
             )
@@ -163,7 +174,17 @@ final class PureQAudioEngineRunner {
             let startCapture: () throws -> Void
             let usesDriverCapture = configuration.prefersDriverCapture && captureDeviceID != nil
             if usesDriverCapture, let captureDeviceID {
-                renderSampleRate = nominalSampleRate(for: captureDeviceID) ?? 48_000
+                renderSampleRate = outputDeviceIDs.values
+                    .compactMap { effectiveSampleRate(for: $0) }
+                    .filter { $0 >= 8_000 }
+                    .max() ?? nominalSampleRate(for: captureDeviceID) ?? 48_000
+                if let mismatch = driverCaptureSampleRateMismatchDescription(
+                    captureDeviceID: captureDeviceID,
+                    outputDeviceIDs: Array(outputDeviceIDs.values),
+                    targetSampleRate: renderSampleRate
+                ) {
+                    throw PureQAudioEngineError.outputSampleRateMismatch(mismatch)
+                }
                 let capture: PureQDriverSharedMemoryCapture
                 if let existingCapture = driverCapture, existingCapture.deviceID == captureDeviceID {
                     capture = existingCapture
@@ -207,6 +228,9 @@ final class PureQAudioEngineRunner {
                 guard let outputDeviceID = outputDeviceIDs[target.outputUID] else {
                     throw PureQAudioEngineError.noOutputDevice
                 }
+                let outputSampleRate = usesDriverCapture
+                    ? (effectiveSampleRate(for: outputDeviceID) ?? renderSampleRate)
+                    : renderSampleRate
                 let observesDriverInput = driverCapture == nil || shouldObserveDriverInput
                 if driverCapture != nil {
                     shouldObserveDriverInput = false
@@ -216,8 +240,8 @@ final class PureQAudioEngineRunner {
                     target: target,
                     enabled: configuration.enabled,
                     outputDeviceID: outputDeviceID,
-                    sampleRate: renderSampleRate,
-                    driverCaptureReader: driverCapture?.makeReader(),
+                    sampleRate: outputSampleRate,
+                    driverCaptureReader: driverCapture?.makeReader(outputSampleRate: outputSampleRate),
                     recordCapture: { [weak self] frameCount in
                         guard observesDriverInput else { return }
                         self?.recordCapture(frameCount: frameCount)
@@ -226,8 +250,13 @@ final class PureQAudioEngineRunner {
                         guard observesDriverInput else { return }
                         self?.analyze(inputData: inputData, frameCount: frameCount)
                     },
-                    recordRender: { [weak self] requestedFrames, renderedFrames in
-                        self?.recordRender(requestedFrames: requestedFrames, renderedFrames: renderedFrames)
+                    recordRender: { [weak self] requestedFrames, renderedFrames, peakLevel, clippedSamples in
+                        self?.recordRender(
+                            requestedFrames: requestedFrames,
+                            renderedFrames: renderedFrames,
+                            peakLevel: peakLevel,
+                            clippedSamples: clippedSamples
+                        )
                     }
                 )
                 setOutputRenderer(renderer, for: target.outputUID)
@@ -323,8 +352,12 @@ final class PureQAudioEngineRunner {
         configureAnalyzers(sampleRate: currentRenderSampleRate, frameRate: configuration.visualAnalyzerFrameRate)
         setSpectrumAnalyzerEnabled(configuration.spectrumAnalyzerEnabled)
         setBandMetersEnabled(configuration.bandMetersEnabled)
+        let activeOutputUIDs = Set(configuration.renderTargets.map(\.outputUID))
         for target in configuration.renderTargets {
             outputRenderer(for: target.outputUID)?.update(target: target, enabled: configuration.enabled)
+        }
+        for renderer in outputRendererSnapshot() where !activeOutputUIDs.contains(renderer.outputUID) {
+            renderer.suspendOutput()
         }
     }
 
@@ -481,7 +514,7 @@ final class PureQAudioEngineRunner {
             throw PureQAudioEngineError.noRoutedSources
         }
 
-        try prepareSuppressionTap(description: try makeFullSuppressionTapDescription())
+        try prepareSuppressionTap(description: try makeSilenceSuppressionTapDescription(for: suppressedSources))
         return nominalSampleRate(for: suppressionAggregateDeviceID) ?? 48_000
     }
 
@@ -515,29 +548,18 @@ final class PureQAudioEngineRunner {
                 throw PureQAudioEngineError.processObjectLookupFailed(selfPID)
             }
             description = CATapDescription(stereoGlobalTapButExcludeProcesses: [selfProcessObjectID])
-        } else if #available(macOS 26.0, *) {
-            let bundleIDs = Array(Set(routedSources.compactMap(\.bundleIdentifier))).sorted()
-            guard !bundleIDs.isEmpty else {
-                throw PureQAudioEngineError.noRunningProcessSource
-            }
-            description = CATapDescription()
-            description.bundleIDs = bundleIDs
-            description.isProcessRestoreEnabled = true
-            description.isExclusive = false
-            description.isMixdown = true
-            description.isMono = false
         } else {
-            let processIDs = Array(Set(routedSources.compactMap(\.processIdentifier))).sorted()
-            let processObjectIDs = try processIDs.map { pid -> AudioObjectID in
-                guard let objectID = processObjectID(for: pid) else {
-                    throw PureQAudioEngineError.processObjectLookupFailed(pid)
-                }
-                return objectID
-            }
-            guard !processObjectIDs.isEmpty else {
+            let bundleIDs = sourceBundleIDs(from: routedSources)
+            let processObjectIDs = sourceProcessObjectIDs(from: routedSources)
+            if !processObjectIDs.isEmpty {
+                description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
+            } else if !sourceProcessIDs(from: routedSources).isEmpty {
+                    description = CATapDescription(stereoMixdownOfProcesses: try resolveProcessObjectIDs(for: sourceProcessIDs(from: routedSources)))
+            } else if #available(macOS 26.0, *), !bundleIDs.isEmpty {
+                description = makeBundleTapDescription(bundleIDs: bundleIDs, isExclusive: false)
+            } else {
                 throw PureQAudioEngineError.noRunningProcessSource
             }
-            description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
         }
 
         description.name = "PureQ Source Tap"
@@ -618,51 +640,116 @@ final class PureQAudioEngineRunner {
     }
 
     @available(macOS 14.2, *)
-    private func makeSuppressionTapDescription(for routedSources: [AudioEngineSourceRoute]) throws -> CATapDescription? {
-        let selfBundleID = Bundle.main.bundleIdentifier
+    private func makeSilenceSuppressionTapDescription(for suppressedSources: [AudioEngineSourceRoute]) throws -> CATapDescription {
+        if suppressedSources.contains(where: { $0.sourceID == AudioSourceItem.systemMixID }) {
+            return try makeFullSuppressionTapDescription()
+        }
 
-        if #available(macOS 26.0, *) {
-            var excludedBundleIDs = Set(routedSources.compactMap(\.bundleIdentifier))
-            if let selfBundleID {
-                excludedBundleIDs.insert(selfBundleID)
-            }
-            guard !excludedBundleIDs.isEmpty else {
-                return nil
-            }
-
-            let description = CATapDescription()
-            description.bundleIDs = Array(excludedBundleIDs).sorted()
-            description.isProcessRestoreEnabled = true
-            description.isExclusive = true
-            description.isMixdown = true
-            description.isMono = false
-            description.name = "PureQ Source Suppression Tap"
-            description.uuid = UUID()
-            description.isPrivate = true
-            description.muteBehavior = CATapMuteBehavior.mutedWhenTapped
+        let processObjectIDs = sourceProcessObjectIDs(from: suppressedSources)
+        if !processObjectIDs.isEmpty {
+            let description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
+            configureSuppressionTapDescription(description)
             return description
         }
 
+        let processIDs = sourceProcessIDs(from: suppressedSources)
+        if !processIDs.isEmpty {
+            let description = CATapDescription(stereoMixdownOfProcesses: try resolveProcessObjectIDs(for: processIDs))
+            configureSuppressionTapDescription(description)
+            return description
+        }
+
+        let bundleIDs = sourceBundleIDs(from: suppressedSources)
+        if #available(macOS 26.0, *), !bundleIDs.isEmpty {
+            let description = makeBundleTapDescription(bundleIDs: bundleIDs, isExclusive: false)
+            configureSuppressionTapDescription(description)
+            return description
+        }
+
+        throw PureQAudioEngineError.noRunningProcessSource
+    }
+
+    @available(macOS 14.2, *)
+    private func makeSuppressionTapDescription(for routedSources: [AudioEngineSourceRoute]) throws -> CATapDescription? {
+        let selfBundleID = Bundle.main.bundleIdentifier
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        var excludedObjectIDs: [AudioObjectID] = []
         guard let selfProcessObjectID = processObjectID(for: selfPID) else {
             throw PureQAudioEngineError.processObjectLookupFailed(selfPID)
         }
-        excludedObjectIDs.append(selfProcessObjectID)
 
-        let processIDs = Array(Set(routedSources.compactMap(\.processIdentifier))).sorted()
-        for pid in processIDs {
-            guard let objectID = processObjectID(for: pid) else {
-                throw PureQAudioEngineError.processObjectLookupFailed(pid)
-            }
-            excludedObjectIDs.append(objectID)
+        let processObjectIDs = sourceProcessObjectIDs(from: routedSources)
+        if !processObjectIDs.isEmpty {
+            let description = CATapDescription(
+                stereoGlobalTapButExcludeProcesses: [selfProcessObjectID] + processObjectIDs
+            )
+            configureSuppressionTapDescription(description)
+            return description
         }
 
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excludedObjectIDs)
+        let processIDs = sourceProcessIDs(from: routedSources)
+        if !processIDs.isEmpty {
+            let description = CATapDescription(
+                stereoGlobalTapButExcludeProcesses: [selfProcessObjectID] + (try resolveProcessObjectIDs(for: processIDs))
+            )
+            configureSuppressionTapDescription(description)
+            return description
+        }
+
+        let bundleIDs = sourceBundleIDs(from: routedSources)
+        if #available(macOS 26.0, *), !bundleIDs.isEmpty {
+            var excludedBundleIDs = Set(bundleIDs)
+            if let selfBundleID {
+                excludedBundleIDs.insert(selfBundleID)
+            }
+            let description = makeBundleTapDescription(
+                bundleIDs: Array(excludedBundleIDs).sorted(),
+                isExclusive: true
+            )
+            configureSuppressionTapDescription(description)
+            return description
+        }
+
+        return nil
+    }
+
+    @available(macOS 14.2, *)
+    private func configureSuppressionTapDescription(_ description: CATapDescription) {
         description.name = "PureQ Source Suppression Tap"
         description.uuid = UUID()
         description.isPrivate = true
         description.muteBehavior = CATapMuteBehavior.mutedWhenTapped
+    }
+
+    @available(macOS 14.2, *)
+    private func resolveProcessObjectIDs(for processIDs: [pid_t]) throws -> [AudioObjectID] {
+        try processIDs.map { pid -> AudioObjectID in
+            guard let objectID = processObjectID(for: pid) else {
+                throw PureQAudioEngineError.processObjectLookupFailed(pid)
+            }
+            return objectID
+        }
+    }
+
+    private func sourceBundleIDs(from sources: [AudioEngineSourceRoute]) -> [String] {
+        Array(Set(sources.flatMap(\.bundleIdentifiers))).sorted()
+    }
+
+    private func sourceProcessIDs(from sources: [AudioEngineSourceRoute]) -> [pid_t] {
+        Array(Set(sources.compactMap(\.processIdentifier))).sorted()
+    }
+
+    private func sourceProcessObjectIDs(from sources: [AudioEngineSourceRoute]) -> [AudioObjectID] {
+        Array(Set(sources.flatMap(\.processObjectIDs))).sorted()
+    }
+
+    @available(macOS 26.0, *)
+    private func makeBundleTapDescription(bundleIDs: [String], isExclusive: Bool) -> CATapDescription {
+        let description = CATapDescription()
+        description.bundleIDs = bundleIDs
+        description.isProcessRestoreEnabled = true
+        description.isExclusive = isExclusive
+        description.isMixdown = true
+        description.isMono = false
         return description
     }
 
@@ -676,12 +763,15 @@ final class PureQAudioEngineRunner {
         underrunFrames = 0
         inputCallbacks = 0
         renderCallbacks = 0
+        outputPeakLevelSinceLastSnapshot = 0
+        clippedSampleCount = 0
+        clippedCallbackCount = 0
         telemetryLock.unlock()
     }
 
     private func setRenderSampleRate(_ sampleRate: Double) {
         telemetryLock.lock()
-        currentRenderSampleRate = sampleRate.clamped(to: 8_000...384_000)
+        currentRenderSampleRate = sampleRate.clamped(to: 8_000...768_000)
         telemetryLock.unlock()
     }
 
@@ -694,13 +784,24 @@ final class PureQAudioEngineRunner {
         telemetryLock.unlock()
     }
 
-    private func recordRender(requestedFrames: AVAudioFrameCount, renderedFrames renderedFrameCount: UInt32) {
+    private func recordRender(
+        requestedFrames: AVAudioFrameCount,
+        renderedFrames renderedFrameCount: UInt32,
+        peakLevel: Float,
+        clippedSamples: UInt32
+    ) {
         guard telemetryLock.try() else {
             return
         }
         renderedFrames += UInt64(renderedFrameCount)
         if renderedFrameCount < requestedFrames {
             underrunFrames += UInt64(requestedFrames - renderedFrameCount)
+        }
+        let finitePeakLevel = peakLevel.isFinite ? Double(peakLevel) : 8
+        outputPeakLevelSinceLastSnapshot = max(outputPeakLevelSinceLastSnapshot, finitePeakLevel.clamped(to: 0...8))
+        if clippedSamples > 0 {
+            clippedSampleCount += UInt64(clippedSamples)
+            clippedCallbackCount += 1
         }
         renderCallbacks += 1
         telemetryLock.unlock()
@@ -747,6 +848,162 @@ final class PureQAudioEngineRunner {
             return nil
         }
         return sampleRate
+    }
+
+    private func actualSampleRate(for deviceID: AudioDeviceID) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyActualSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            return nil
+        }
+
+        var sampleRate = Float64(0)
+        var dataSize = UInt32(MemoryLayout<Float64>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &sampleRate)
+        guard status == noErr, sampleRate > 0 else {
+            return nil
+        }
+        return sampleRate
+    }
+
+    private func effectiveSampleRate(for deviceID: AudioDeviceID) -> Double? {
+        actualSampleRate(for: deviceID) ?? nominalSampleRate(for: deviceID)
+    }
+
+    private func driverCaptureSampleRateMismatchDescription(
+        captureDeviceID: AudioDeviceID,
+        outputDeviceIDs: [AudioDeviceID],
+        targetSampleRate: Double
+    ) -> String? {
+        let resolvedTarget = targetSampleRate.clamped(to: 8_000...768_000)
+        var captureMismatches: [String] = []
+        if let nominalRate = nominalSampleRate(for: captureDeviceID),
+           !sampleRatesMatch(nominalRate, resolvedTarget) {
+            captureMismatches.append("nominal \(sampleRateDescription(nominalRate))")
+        }
+        if let captureRate = effectiveSampleRate(for: captureDeviceID),
+           !sampleRatesMatch(captureRate, resolvedTarget) {
+            captureMismatches.append("actual \(sampleRateDescription(captureRate))")
+        }
+        let streamRates = streamSampleRates(for: captureDeviceID)
+        let mismatchedStreamRates = streamRates.filter { !sampleRatesMatch($0, resolvedTarget) }
+        if !mismatchedStreamRates.isEmpty {
+            captureMismatches.append("stream \(sampleRateListDescription(mismatchedStreamRates))")
+        }
+        if !captureMismatches.isEmpty {
+            return "PureQ Virtual Output is not synchronized (\(captureMismatches.joined(separator: ", "))) while the render path expects \(sampleRateDescription(resolvedTarget)). Repair/restart the driver, then start the engine again."
+        }
+
+        for outputDeviceID in outputDeviceIDs {
+            guard let outputRate = effectiveSampleRate(for: outputDeviceID) else { continue }
+            if !sampleRatesMatch(outputRate, resolvedTarget) {
+                return "A routed hardware output is running at \(sampleRateDescription(outputRate)) while PureQ Virtual Output is running at \(sampleRateDescription(resolvedTarget)). For now, routed outputs must share one sample rate."
+            }
+        }
+
+        return nil
+    }
+
+    private func streamSampleRates(for deviceID: AudioDeviceID) -> [Double] {
+        let scopes = [
+            kAudioObjectPropertyScopeInput,
+            kAudioObjectPropertyScopeOutput
+        ]
+        let selectors = [
+            kAudioStreamPropertyVirtualFormat,
+            kAudioStreamPropertyPhysicalFormat
+        ]
+
+        var sampleRates: [Double] = []
+        for scope in scopes {
+            for streamID in streamIDs(for: deviceID, scope: scope) {
+                for selector in selectors {
+                    guard let sampleRate = streamSampleRate(for: streamID, selector: selector),
+                          sampleRate > 0,
+                          sampleRate.isFinite else {
+                        continue
+                    }
+                    if !sampleRates.contains(where: { sampleRatesMatch($0, sampleRate) }) {
+                        sampleRates.append(sampleRate)
+                    }
+                }
+            }
+        }
+        return sampleRates.sorted()
+    }
+
+    private func streamIDs(for deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            return []
+        }
+
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize) == noErr else {
+            return []
+        }
+
+        let streamCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard streamCount > 0 else {
+            return []
+        }
+
+        var streamIDs = [AudioObjectID](repeating: 0, count: streamCount)
+        let status = streamIDs.withUnsafeMutableBufferPointer { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, pointer.baseAddress!)
+        }
+        return status == noErr ? streamIDs : []
+    }
+
+    private func streamSampleRate(
+        for streamID: AudioObjectID,
+        selector: AudioObjectPropertySelector
+    ) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(streamID, &address) else {
+            return nil
+        }
+
+        var description = AudioStreamBasicDescription()
+        var dataSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(streamID, &address, 0, nil, &dataSize, &description)
+        guard status == noErr,
+              description.mSampleRate > 0,
+              description.mSampleRate.isFinite else {
+            return nil
+        }
+        return description.mSampleRate
+    }
+
+    private func sampleRatesMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        let tolerance = max(5.0, max(abs(lhs), abs(rhs)) * 0.000_05)
+        return abs(lhs - rhs) <= tolerance
+    }
+
+    private func sampleRateDescription(_ value: Double) -> String {
+        if value >= 1_000 {
+            return String(format: "%.3g kHz", value / 1_000)
+        }
+        return String(format: "%.1f Hz", value)
+    }
+
+    private func sampleRateListDescription(_ values: [Double]) -> String {
+        let uniqueValues = values.reduce(into: [Double]()) { result, value in
+            guard !result.contains(where: { sampleRatesMatch($0, value) }) else { return }
+            result.append(value)
+        }
+        return uniqueValues.map(sampleRateDescription).joined(separator: ", ")
     }
 
     private var processTapsAreAvailable: Bool {
