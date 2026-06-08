@@ -22,6 +22,20 @@ fail() {
   exit 1
 }
 
+run_as_root() {
+  if [[ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    /usr/bin/sudo "$@"
+  fi
+}
+
+refresh_root_authorization() {
+  if [[ "${EUID:-$(/usr/bin/id -u)}" -ne 0 ]]; then
+    /usr/bin/sudo -v
+  fi
+}
+
 require_exact_path() {
   local label="$1"
   local actual="$2"
@@ -42,7 +56,7 @@ safe_rm_rf() {
   local path="$1"
   case "$path" in
     /Applications/PureQ.app|/Applications/PureQ\ Uninstall.command|/Library/Audio/Plug-Ins/HAL/PureQ.driver|/Library/Application\ Support/PureQ|/Library/LaunchAgents/Sean-s-Apps.PureQ.AudioRecovery.plist)
-      sudo /bin/rm -rf "$path"
+      run_as_root /bin/rm -rf "$path"
       ;;
     "$HOME"/Library/Application\ Support/PureQ)
       /bin/rm -rf "$path"
@@ -57,7 +71,7 @@ safe_rm_f() {
   local path="$1"
   case "$path" in
     /Applications/PureQ\ Uninstall.command|/Library/LaunchAgents/Sean-s-Apps.PureQ.AudioRecovery.plist)
-      sudo /bin/rm -f "$path"
+      run_as_root /bin/rm -f "$path"
       ;;
     "$HOME"/Library/Preferences/Sean-s-Apps.PureQ.plist)
       /bin/rm -f "$path"
@@ -91,13 +105,13 @@ bootout_recovery_helper() {
   if [[ -n "$console_user" && "$console_user" != "root" ]]; then
     console_uid="$(/usr/bin/id -u "$console_user" 2>/dev/null || true)"
     if [[ -n "$console_uid" ]]; then
-      sudo /bin/launchctl bootout "gui/$console_uid" "$RECOVERY_AGENT_PATH" >/dev/null 2>&1 || true
+      run_as_root /bin/launchctl bootout "gui/$console_uid" "$RECOVERY_AGENT_PATH" >/dev/null 2>&1 || true
     fi
   fi
 }
 
 require_safe_paths
-sudo -v
+refresh_root_authorization
 bootout_recovery_helper
 quit_running_pureq
 
@@ -108,7 +122,7 @@ fi
 
 if [[ "$REMOVE_DRIVER" == "1" ]]; then
   safe_rm_rf "$DRIVER_INSTALL_PATH"
-  sudo /usr/bin/killall coreaudiod 2>/dev/null || true
+  run_as_root /usr/bin/killall coreaudiod 2>/dev/null || true
 fi
 
 if [[ "$REMOVE_SUPPORT" == "1" ]]; then
